@@ -1,6 +1,6 @@
 # PRD — Hyperliquid Copybot for `0xdae4...7637` ("Paul Wei")
 
-**Status:** Draft v3 · 2026-08-27
+**Status:** Draft v3.1 · 2026-08-27
 **Repo:** `bankkomin/hyperliquid-copybot`
 **Leader:** [`0xdae4df7207feb3b350e4284c8efe5f7dac37f637`](https://hyperbot.network/trader/0xdae4df7207feb3b350e4284c8efe5f7dac37f637) — BTC perp only, tracked at [paul.catseye.today](https://paul.catseye.today/)
 
@@ -432,12 +432,16 @@ Runs as a daemon thread inside the bot process (one process = one pid = simple `
 ├──────────────────────────────────────────────────────────────────────┤
 │  BTC PRICE · CANDLES (catseye-style)         [1d] [4h] [1h] [15m]    │
 │                                                                      │
-│      Hyperliquid candles                                  [chart]    │
-│      ─ ─ ─  leader resting buy ladder (green dashed lines)           │
-│      ─ ─ ─  our resting orders (bright green/red lines)              │
+│   $80,471 ┤        ╷╵╷ Hyperliquid candles                 [chart]   │
+│           ┤   ╷╵╷╵╵                                                  │
+│   $73,521 ┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ 0.05 │ ours 0.00752 ── PENDING BUY   │
+│   $68,851 ┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ 0.10 │ ours 0.01505 ── PENDING BUY   │
+│   $62,944 ┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ 0.12 │ ours 0.01806 ── PENDING BUY   │
+│   $57,860 ┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ 0.20 │ ours 0.03010 ── PENDING BUY   │
 │      ▲▼ leader fills (solid marker)  △▽ our fills (hollow marker)    │
 │      ───  kill-switch equity level; stop overlay if enabled (red)    │
 │      Order lines: [Off] [Top 4] [Top 8] [All]   Fills: [All][Taker]  │
+│      Unfilled order opacity: 50% · sells red, buys green (catseye)   │
 ├──────────────────────────────────────────────────────────────────────┤
 │  ACTUAL LEVERAGE % (ours vs leader, signed)               [chart]    │
 │  CUMULATIVE PnL  [USD | BTC]  (ours vs leader × scale)    [chart]    │
@@ -476,7 +480,7 @@ Chart section — what we copy from catseye and what we defer:
 | Catseye feature | v1 | How |
 |---|---|---|
 | Candles 1d/4h/1h/15m (Hyperliquid's own data) | ✓ | `candleSnapshot` info API, fetched on refresh, cached in memory (not stored in DB) |
-| Order lines on chart (Off/Top 4/8/All) | ✓ | `leader_open_orders` + our `orders` → horizontal dashed lines |
+| **Pending-order overlay on chart** (Off/Top 4/8/All) | ✓ **REQUIRED — M1 acceptance criterion** | Every live pending order of BOTH accounts drawn as a horizontal dashed line at its limit price, labeled `size @ price` (leader solid label, ours appended), buys green / sells red, 50% opacity until filled — exactly catseye's order-line behavior. Sourced live from `leader_open_orders` + our `orders` (status = open) on every 15 s refresh; a canceled/filled order must disappear from the overlay on the next refresh |
 | Fill markers, buy/sell colored, taker filter | ✓ | `leader_fills` + our `fills` → triangle markers; ours hollow so the two accounts are distinguishable at a glance |
 | Stop-overlay levels drawn on the chart | ✓ (ours only — catseye has none because the leader has none) | computed from position entry + §6.2 M1 levels |
 | Leverage % time series (signed) | ✓ | `snapshots` both accounts, two lines |
@@ -581,7 +585,7 @@ flowchart LR
 
 | Phase | Deliverable | Exit criteria |
 |---|---|---|
-| **M1 Shadow** | Watcher + Sizer + Risk Gate in `paper` mode **+ SQLite store + dashboard + daily report + .bat runbook** | 2 weeks running standalone on the VPS; decisions match leader moves; zero crashes; risk vetoes reviewed via dashboard |
+| **M1 Shadow** | Watcher + Sizer + Risk Gate in `paper` mode **+ SQLite store + dashboard + daily report + .bat runbook** | 2 weeks running standalone on the VPS; decisions match leader moves; zero crashes; risk vetoes reviewed via dashboard; **candle chart shows the live pending-order overlay for both accounts (catseye-style), verified against paul.catseye.today side by side** |
 | **M2 Live-small** | Executor live, account funded with **test-size capital only** | Full ladder mirrored (parity ≥ 99%); 2+ rungs filled alongside his as maker; drift < 1%; kill-switch fire-drilled on testnet |
 | **M3 Hardened** | Watchdogs, HALT drill, restart-recovery test (kill -9 mid-sync, reboot test) | Restart converges to correct position with no duplicate orders; stale-pid + startup-cancel verified |
 | **M4 Optional** | Order-ladder mirroring flag, multi-leader, remote dashboard access | Only if M2/M3 economics justify it |
