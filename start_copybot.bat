@@ -3,12 +3,14 @@ rem Double-click to run. First run installs everything; later runs just start.
 cd /d %~dp0
 
 rem ---------- auto-setup ----------
+rem Failure paths use `timeout`, never `pause`: an unattended restart on a
+rem headless VPS would block forever on a prompt nobody can answer.
 if not exist venv\Scripts\python.exe (
   echo [setup] Creating virtual environment...
   py -3 -m venv venv 2>nul || python -m venv venv
   if not exist venv\Scripts\python.exe (
     echo [setup] FAILED: install Python 3.10+ from python.org, then run this again.
-    pause & exit /b 1
+    ping -n 31 127.0.0.1 >nul & exit /b 1
   )
 )
 fc /b requirements.txt venv\.installed >nul 2>&1
@@ -16,8 +18,24 @@ if errorlevel 1 (
   echo [setup] Installing dependencies...
   venv\Scripts\python.exe -m pip install --upgrade pip --quiet
   venv\Scripts\python.exe -m pip install -r requirements.txt --quiet
-  if errorlevel 1 ( echo [setup] pip install FAILED & pause & exit /b 1 )
   copy /y requirements.txt venv\.installed >nul
+)
+
+rem Trust nothing: prove the install works by importing what we actually need.
+rem pip can report success while leaving a broken tree, and on a deep folder it
+rem fails with WinError 206 (path too long) part-way through.
+venv\Scripts\python.exe -c "import dash, plotly, pydantic, yaml, aiohttp, structlog" 2>nul
+if errorlevel 1 (
+  del venv\.installed 2>nul
+  echo.
+  echo [setup] Dependencies are NOT usable after install.
+  echo [setup] Most common cause on Windows: this folder's path is too long.
+  echo [setup]   folder: %CD%
+  echo [setup]   fix   : move the project nearer the drive root ^(e.g. C:\copybot^),
+  echo [setup]           or enable Long Path support:
+  echo [setup]           https://pip.pypa.io/warnings/enable-long-paths
+  echo.
+  ping -n 31 127.0.0.1 >nul & exit /b 1
 )
 if not exist config.yaml copy config.example.yaml config.yaml >nul
 if not exist logs mkdir logs
@@ -38,7 +56,8 @@ if "%STILL_RUNNING%"=="1" (
 rem ---------- launch ----------
 echo Starting copybot in the background...
 start "" venv\Scripts\pythonw.exe -m src.main
-timeout /t 5 >nul
+rem `timeout` fails when stdin is redirected (scheduled tasks, piped runs); ping always works.
+ping -n 6 127.0.0.1 >nul
 if not exist logs\copybot.pid (
   echo WARNING: no pid file yet. Check logs\copybot.jsonl for errors.
 )

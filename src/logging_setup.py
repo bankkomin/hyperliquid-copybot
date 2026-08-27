@@ -20,12 +20,12 @@ def configure(log_path: Path = LOG_PATH) -> None:
         log_path, when="midnight", backupCount=14, encoding="utf-8"
     )
     handler.setFormatter(logging.Formatter("%(message)s"))
+    # Flask/Dash/werkzeug log plain sentences through the same root logger. Drop
+    # anything that is not a JSON object so the file stays parseable as JSONL.
+    handler.addFilter(lambda r: r.getMessage().startswith("{"))
     root = logging.getLogger()
     root.handlers = [handler]  # never a StreamHandler: stdout is None under pythonw
     root.setLevel(logging.INFO)
-    # Flask/Dash write plain text through logging; keep the file valid JSONL.
-    for noisy in ("werkzeug", "dash", "dash.dash"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
 
     structlog.configure(
         processors=[
