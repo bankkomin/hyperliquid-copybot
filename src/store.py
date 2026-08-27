@@ -220,8 +220,22 @@ class Store:
     def update_equity(self, ts_ms: int, equity: float) -> float:
         """Append to the equity curve, return drawdown % vs the PERSISTED high-water
         mark. The HWM must survive restarts or the kill-switch could be reset by a
-        reboot."""
-        prev = self.conn.execute("SELECT MAX(hwm) FROM equity_curve").fetchone()[0]
+        reboot.
+
+        A manual_reset re-bases the HWM to the equity at that moment. Without
+        this the documented un-HALT path is a no-op: drawdown is still measured
+        against the pre-crash peak, so run_monitors re-HALTs on the very next
+        cycle and the bot can never be resumed.
+        """
+        epoch = self.conn.execute(
+            "SELECT ts FROM events WHERE kind='manual_reset' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if epoch:
+            prev = self.conn.execute(
+                "SELECT MAX(hwm) FROM equity_curve WHERE ts >= ?", (epoch[0],)
+            ).fetchone()[0]
+        else:
+            prev = self.conn.execute("SELECT MAX(hwm) FROM equity_curve").fetchone()[0]
         hwm = max(prev if prev is not None else equity, equity)
         dd = (equity / hwm - 1) * 100 if hwm else 0.0
         self.conn.execute(

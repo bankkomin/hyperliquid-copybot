@@ -102,8 +102,14 @@ async def _ingest_leader_fills(deps: Deps, leader, now_ms: int) -> None:
     deps.store.conn.commit()
 
     # Snapshot our book ONCE: LiveBroker.open is an API call, so touching it per
-    # rung would be an N+1 against the exchange every cycle.
-    our_open = set(deps.broker.open)
+    # rung would be an N+1 against the exchange every cycle. If it cannot be read
+    # we skip the his_fill sweep rather than guess — closing a row for an order
+    # that is actually still resting would orphan it.
+    try:
+        our_open = set(deps.broker.open)
+    except Exception:
+        log.exception("our_open_orders_failed")
+        return
     live_oids = {o.oid for o in leader.open_orders}
     for loid, m in mirror_before.items():
         if loid not in live_oids and m["our_oid"] not in our_open:
@@ -134,16 +140,24 @@ def _enforce_halt(deps: Deps, ours: AccountState, mark_px: float, now_ms: int) -
     give up after a single attempt: the IOC fires during the very crash that
     triggered HALT, which is exactly when it misses the book.
     """
-    canceled = deps.broker.cancel_all()
+    try:
+        canceled = deps.broker.cancel_all()
+    except Exception:
+        log.exception("halt_cancel_all_failed")
+        canceled = 0
     for loid in deps.store.mirror_get():
         deps.store.mirror_close(loid, now_ms, "halt")
     filled = True
-    if ours.position:
+    if ours.position and mark_px:
         filled = deps.broker.market_fill(
             "A" if ours.position > 0 else "B", abs(ours.position), mark_px, now_ms,
             reduce_only=True,  # can never flip us into fresh naked exposure
         )
-    still_open = len(deps.broker.open)
+    elif ours.position:
+        filled = False  # no usable mark price yet; retry next cycle
+    # book_is_clean() is False when the exchange could not be asked — an
+    # unanswered query must never be reported as a clean book.
+    still_open = 0 if deps.broker.book_is_clean() else 1
     clean = filled and not still_open
     log.critical(
         "halt_enforced", position=ours.position, canceled=canceled,
@@ -158,6 +172,16 @@ def _enforce_halt(deps: Deps, ours: AccountState, mark_px: float, now_ms: int) -
 
 
 async def cycle(deps: Deps, now_ms: int) -> None:
+    # HALT enforcement runs FIRST and never depends on the leader API: flattening
+    # our own account has nothing to do with his data, and the leader endpoint is
+    # most likely to be degraded during the crash that caused the HALT.
+    if RiskState(deps.store.latest_risk_state()) == RiskState.HALT:
+        mark = deps.last_leader.mark_px if deps.last_leader else 0.0
+        ours = deps.broker.state(mark, now_ms)
+        if ours.position or not deps.broker.book_is_clean():
+            _enforce_halt(deps, ours, mark, now_ms)
+        return
+
     fetched = await _fetch_leader(deps, now_ms)
     if fetched is None:
         return
@@ -200,11 +224,7 @@ async def cycle(deps: Deps, now_ms: int) -> None:
             _enforce_halt(deps, ours, leader.mark_px, now_ms)
     state = new_state
     if state == RiskState.HALT:
-        # Keep enforcing while anything is still exposed. A single attempt is
-        # not enough: the flatten IOC fires during the crash that caused HALT.
-        if ours.position or deps.broker.open:
-            _enforce_halt(deps, ours, leader.mark_px, now_ms)
-        return
+        return  # enforcement already ran above; next cycle re-checks until clean
 
     if leader.equity <= 0:  # liquidated / withdrawn: no ratio to mirror by
         deps.store.record_event(now_ms, "critical", "leader_zero_equity", "cannot compute scale")
@@ -325,11 +345,34 @@ def startup(deps: Deps) -> None:
     mirror rows still describe real orders and must NOT be cleared.
     """
     now_ms = int(time.time() * 1000)
+
+    # Consume a stop request that was never completed (e.g. the operator ran
+    # stop_copybot.bat against an already-dead process). Left latched, it would
+    # make every future start run one cycle and immediately shut down again.
+    if deps.store.stop_requested():
+        deps.store.record_event(now_ms, "info", "stopped", "stale stop request cleared at startup")
+        log.warning("stale_stop_request_cleared")
+
     if deps.cfg.mode == "live":
-        n = deps.broker.cancel_all()
-        for loid in deps.store.mirror_get():
-            deps.store.mirror_close(loid, now_ms, "restart")
-        log.info("startup_recovery", canceled=n)
+        try:
+            n = deps.broker.cancel_all()
+        except Exception:
+            log.exception("startup_cancel_all_failed")
+            n = 0
+        # Only forget the old ladder once the exchange confirms it is gone.
+        # Wiping rows we did not actually cancel orphans live orders that
+        # diff_ladders can never reach again, while the first cycle re-places
+        # the same rungs — double size, half of it unmanaged.
+        if deps.broker.book_is_clean():
+            for loid in deps.store.mirror_get():
+                deps.store.mirror_close(loid, now_ms, "restart")
+            log.info("startup_recovery", canceled=n, book="clean")
+        else:
+            deps.store.record_event(
+                now_ms, "critical", "startup_dirty_book",
+                f"cancel_all confirmed {n}; orders may still rest — mirror rows kept",
+            )
+            log.critical("startup_recovery_incomplete", canceled=n)
 
     state = deps.store.latest_risk_state()
     if state == RiskState.HALT.value:
@@ -379,14 +422,21 @@ def shutdown(deps: Deps) -> None:
     KEEP the position — stopping the bot must not liquidate a healthy book."""
     now_ms = int(time.time() * 1000)
     canceled = 0
-    if deps.cfg.mode == "live":
-        canceled = deps.broker.cancel_all()
-        for loid in deps.store.mirror_get():
-            deps.store.mirror_close(loid, now_ms, "shutdown")
-    pos = deps.broker.state(deps.last_leader.mark_px if deps.last_leader else 0.0, now_ms).position
-    deps.store.record_event(
-        now_ms, "info", "stopped", f"canceled={canceled} position_kept={pos}"
-    )
+    try:
+        if deps.cfg.mode == "live":
+            canceled = deps.broker.cancel_all()
+            for loid in deps.store.mirror_get():
+                deps.store.mirror_close(loid, now_ms, "shutdown")
+    except Exception:
+        log.exception("shutdown_cancel_failed")
+    # Record `stopped` FIRST and unconditionally: if anything below raises, the
+    # stop flag stays latched and every future start would shut itself down.
+    deps.store.record_event(now_ms, "info", "stopped", f"canceled={canceled}")
+    try:
+        mark = deps.last_leader.mark_px if deps.last_leader else 0.0
+        pos = deps.broker.state(mark, now_ms).position if mark else None
+    except Exception:
+        pos = None
     log.info("shutdown_complete", canceled=canceled, position_kept=pos)
 
 
@@ -414,10 +464,21 @@ def main() -> None:
         from src.dashboard import make_app
 
         app = make_app(cfg)
-        threading.Thread(
-            target=lambda: app.run(port=cfg.dashboard.port, debug=False),
-            daemon=True,
-        ).start()
+
+        def _serve() -> None:
+            # A dead dashboard means no HALT button and no equity view while the
+            # bot keeps trading. Under pythonw the traceback would go to a
+            # non-existent stderr, so record it where the operator can find it.
+            try:
+                app.run(port=cfg.dashboard.port, debug=False)
+            except Exception:
+                log.exception("dashboard_failed", port=cfg.dashboard.port)
+                Store(cfg.storage.db_path).record_event(
+                    int(time.time() * 1000), "critical", "dashboard_down",
+                    f"port {cfg.dashboard.port} unavailable — no HALT button",
+                )
+
+        threading.Thread(target=_serve, daemon=True).start()
         asyncio.run(run(cfg))
     except KeyboardInterrupt:
         log.info("shutdown_requested")

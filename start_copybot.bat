@@ -26,11 +26,13 @@ if not exist reports mkdir reports
 
 rem ---------- stale-pid guard ----------
 rem A crash or reboot leaves the pid file behind. Only refuse to start when that
-rem PID is genuinely still alive, or the VPS would never auto-restart itself.
+rem PID is genuinely still alive AND is one of ours, or the VPS would never
+rem auto-restart itself. No pause on this path: on a headless VPS an unattended
+rem restart would block forever on it.
 if exist logs\copybot.pid call :check_stale
 if "%STILL_RUNNING%"=="1" (
   echo Copybot is already running. Use stop_copybot.bat first.
-  pause & exit /b 1
+  exit /b 1
 )
 
 rem ---------- launch ----------
@@ -45,12 +47,20 @@ exit /b 0
 
 :check_stale
 set STILL_RUNNING=
+set OLDPID=
 set /p OLDPID=<logs\copybot.pid
-tasklist /fi "PID eq %OLDPID%" 2>nul | find "%OLDPID%" >nul
+if "%OLDPID%"=="" (
+  echo [setup] Empty pid file, removing.
+  del logs\copybot.pid
+  goto :eof
+)
+rem Filter on IMAGENAME too: Windows recycles PIDs, and matching a random
+rem svchost would block the restart of a bot that is actually dead.
+tasklist /fi "PID eq %OLDPID%" /fi "IMAGENAME eq pythonw.exe" 2>nul | find "%OLDPID%" >nul
 if not errorlevel 1 (
   set STILL_RUNNING=1
   goto :eof
 )
-echo [setup] Removing stale pid file from PID %OLDPID% ^(process is gone^).
+echo [setup] Removing stale pid file from PID %OLDPID% ^(no pythonw with that id^).
 del logs\copybot.pid
 goto :eof

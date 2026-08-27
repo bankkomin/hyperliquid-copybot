@@ -130,26 +130,40 @@ class LiveBroker:
     def cancel_all(self) -> int:
         """Safety-critical (kill-switch, startup recovery): isolate per-order
         errors and return CONFIRMED cancels, so a single 429 cannot leave the
-        rest of the ladder resting while the caller believes cleanup ran."""
+        rest of the ladder resting while the caller believes cleanup ran.
+
+        Raises if the book cannot be read at all — callers must not mistake an
+        unanswered query for an empty one.
+        """
         oids = list(self.open)
         ok = sum(1 for oid in oids if self._cancel_ok(oid))
         if ok < len(oids):
             log.warning("cancel_all_incomplete", canceled=ok, total=len(oids))
         return ok
 
+    def book_is_clean(self) -> bool:
+        """Verified-empty book. False on API failure — unknown is never clean."""
+        try:
+            return not self.open
+        except Exception:
+            log.exception("book_check_failed")
+            return False
+
     # ---- state ----------------------------------------------------------
     @property
     def open(self) -> dict:
-        """Our live resting orders, keyed by oid (mirrors PaperBroker.open)."""
-        try:
-            return {
-                o["oid"]: o
-                for o in self.info.frontend_open_orders(self.address)
-                if o.get("coin") == "BTC"
-            }
-        except Exception:
-            log.exception("open_orders_failed")
-            return {}
+        """Our live resting orders, keyed by oid (mirrors PaperBroker.open).
+
+        RAISES on API failure — it must never return {} for "I could not ask".
+        An empty book and an unanswered question look identical to every safety
+        check that counts orders, and treating a timeout as "clean" is how a
+        HALT reports success while the ladder is still resting.
+        """
+        return {
+            o["oid"]: o
+            for o in self.info.frontend_open_orders(self.address)
+            if o.get("coin") == "BTC"
+        }
 
     def state(self, mark_px: float, now_ms: int) -> AccountState:
         ch = self.info.user_state(self.address)

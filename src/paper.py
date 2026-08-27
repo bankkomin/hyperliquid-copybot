@@ -149,6 +149,9 @@ class PaperBroker:
         self.open.clear()
         return n
 
+    def book_is_clean(self) -> bool:
+        return not self.open
+
     def state(self, mark_px: float, now_ms: int) -> AccountState:
         upnl = (mark_px - self.avg_entry) * self.position if self.avg_entry else 0.0
         return AccountState(
