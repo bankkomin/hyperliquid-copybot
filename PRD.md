@@ -1,16 +1,17 @@
 # PRD — Hyperliquid Copybot for `0xdae4...7637` ("Paul Wei")
 
-**Status:** Draft v2.1 · 2026-08-27
+**Status:** Draft v3 · 2026-08-27
 **Repo:** `bankkomin/hyperliquid-copybot`
 **Leader:** [`0xdae4df7207feb3b350e4284c8efe5f7dac37f637`](https://hyperbot.network/trader/0xdae4df7207feb3b350e4284c8efe5f7dac37f637) — BTC perp only, tracked at [paul.catseye.today](https://paul.catseye.today/)
 
-> **v2 changes:** added data storage schema (§10), dashboard + daily report spec with examples (§11), standalone double-click operation (§12). Dashboard promoted from "optional M4" to core M1 deliverable.
+> **v3 changes:** switched to a FULL MIRROR — the leader's resting order ladder, sizing proportions, margin config, and risk profile are all copied (§4–§6). Our own risk layer reduced to account-level backstops (mirror parity, −35% kill-switch, watchdog); leverage clamp, add-throttle, and stop overlay removed from defaults.
+> **v2 changes:** added data storage schema (§10), dashboard + daily report spec with examples (§11), standalone double-click operation (§12).
 
 ---
 
 ## 1. Goal
 
-Mirror the leader's BTC perp exposure on our own Hyperliquid account, scaled to our equity, **with a risk overlay the leader does not have**. Risk management and position sizing are the primary system functions — copying is secondary.
+**Fully replicate the leader's book on our own Hyperliquid account, scaled to our equity** — his position, his resting order ladder, his sizing proportions, and his risk profile. The leader's risk management IS his ladder structure (pyramid sizing deeper into dips, maker-only entries, partial distribution into rallies, no stops) — so the bot copies that structure faithfully instead of replacing it. Our own risk layer is reduced to **account-level backstops** (drawdown kill-switch, connection watchdog) that only fire when the mirror itself is in danger, not to second-guess his trades.
 
 **Standalone requirement:** the whole product is one folder on the VPS. Double-click `start_copybot.bat` → Python runs in the background, the tracking dashboard opens in the browser. No terminal babysitting.
 
@@ -75,16 +76,31 @@ Every order flows **Watcher → Sizer → Risk Gate → Executor**. Nothing reac
 
 ---
 
-## 4. Copy strategy: position-sync, not fill-mirror
+## 4. Copy strategy: full order-mirror + position reconciliation
 
-Two standard approaches exist in open-source copybots:
+Three approaches exist across open-source copybots — we use two of them, layered:
 
-| Approach | Used by | Fit here |
+| Approach | Used by | Role here |
 |---|---|---|
-| **Fill-mirror** — react to each leader fill, replicate it | [zkOSAI](https://github.com/zkOSAI/hyperliquid-copy-trading-bot), [jestersimpps](https://github.com/jestersimpps/hyperliquid-copytrader) | ✗ We'd taker-cross on every maker fill he gets; misses fills during our downtime; drift accumulates |
-| **Position-sync** — converge our position toward `leader_position × scale` | [MaxIsOntoSomething](https://github.com/MaxIsOntoSomething/Hyperliquid_Copy_Trader) (startup), jestersimpps (drift sync) | ✓ Self-healing, restart-safe, naturally deduplicates his ladder churn |
+| **Order-mirror** — replicate the leader's *resting* orders (place/cancel/replace), scaled | (none of the referenced bots do this fully) | ✓ **PRIMARY.** The ladder is his strategy AND his risk management — copying it gives us his maker fills, his pyramid sizing, and his entry prices, not laggy taker copies |
+| **Position-sync** — converge our position toward `leader_position × scale` | [MaxIsOntoSomething](https://github.com/MaxIsOntoSomething/Hyperliquid_Copy_Trader), [jestersimpps](https://github.com/jestersimpps/hyperliquid-copytrader) (drift sync) | ✓ **RECONCILIATION.** Runs every 60s; catches anything the order-mirror missed (downtime, partial fills, his taker trades) and converges position drift > 1% |
+| **Fill-mirror** — react to each leader fill with a taker copy | [zkOSAI](https://github.com/zkOSAI/hyperliquid-copy-trading-bot) | ✗ Not used standalone — his fills hit OUR mirrored orders at the same prices; taker copy only appears inside reconciliation |
 
-**Decision: position-sync is the source of truth.** WS fill events are just *triggers* to re-sync early; a poll timer (60s) is the fallback trigger. This is the same "drift sync" pattern jestersimpps uses (1% drift threshold), promoted from safety-net to primary mechanism.
+### 4.1 Order-mirror mechanics
+
+The Watcher subscribes to the leader's `orderUpdates` WS stream and polls `frontendOpenOrders` (60s fallback). The target state is always: *our open orders = his open orders × scale, same prices, same side*.
+
+```
+his ladder changes (place / cancel / modify)
+        → diff his ladder vs our mirrored ladder (via mirror_map)
+        → place / cancel ours to match, each order sized sz_his × scale
+        → risk backstops (§6) check the LADDER TOTAL, not each order's direction
+```
+
+- **Same prices as his** → when BTC dips to his rung, both accounts fill together as makers. No lag, no taker fee, entry parity.
+- His fills reduce his order; ours reduce ours proportionally — the books stay parallel without any fill-chasing.
+- His taker trades (16% of his activity) have no resting order to mirror → picked up by the 60s reconciliation as a scaled taker copy (slippage cap applies).
+- Ladder diffs are idempotent: crash-restart → re-diff from scratch against `mirror_map`, no duplicates.
 
 ```mermaid
 sequenceDiagram
@@ -116,125 +132,122 @@ sequenceDiagram
     end
 ```
 
-**Explicitly NOT copied (v1):** the leader's *resting* order ladder (his 14 open buys $57.9k–$73.5k). We only mirror **filled exposure**. Rationale: mirroring resting orders commits our margin to his future average-down before it happens; position-sync picks up those buys anyway *if* they fill, and our risk gate then decides how much of them we take. Order-ladder mirroring is a Phase-2 option behind a config flag.
+**What this means concretely today:** his 14 resting buys ($57.9k–$73.5k, 0.05→0.20 BTC pyramiding deeper) get mirrored as 14 resting buys on our account at the same prices, each sized × scale. If BTC crashes into the ladder, we average down exactly as he does, proportionally — that *is* the strategy being copied, accepted deliberately (see §6 backstops and §14 economics for what still protects the account).
 
 ---
 
 ## 5. Position sizing (priority #1)
 
-### 5.1 Core formula
+### 5.1 Core formula — everything scales by one ratio
+
+One number drives the whole mirror, applied to every order AND the position:
 
 ```
-scale        = our_equity / leader_equity          # both = perp accountValue, refreshed every sync
-raw_target   = leader_position_btc × scale
-target       = min(raw_target, POS CAP, LEV CAP)   # caps in Section 6
-delta        = target − our_position_btc
-order_size   = round_down(delta, sz_decimals)      # BTC: 5 decimals
+scale            = our_equity / leader_equity      # both = perp accountValue, refreshed every sync
+mirror_order_sz  = leader_order_sz × scale         # per resting order, same limit price as his
+position_target  = leader_position × scale         # reconciliation target (60s loop)
+round: always DOWN to sz_decimals (BTC: 5)
 ```
 
-Worked example at current state (our account = $10,000):
+Because *every* rung uses the same ratio, his sizing structure is preserved automatically — the 0.05 → 0.12 → 0.20 BTC pyramid, the % of account each rung represents, and his leverage profile all carry over exactly. We also mirror his **margin config: cross margin, 3× leverage setting** (read from his `clearinghouseState`).
 
-```
-scale      = 10,000 / 66,435            = 0.1505
-raw_target = 1.33557 × 0.1505           = 0.20103 BTC   (~$16.2k notional @ $80.5k)
-lev check  = 16.2k / 10k = 1.62×  →  > MAX_LEVERAGE 1.5× → clamp
-target     = (10,000 × 1.5) / 80,500    = 0.18634 BTC
-```
+Worked example at current state (our account = $10,000, scale = 10,000 / 66,435 = **0.1505**):
+
+| | Leader | Ours (× 0.1505) | % of own equity |
+|---|---|---|---|
+| Position | 1.33557 BTC ($107.5k, 1.62×) | 0.20103 BTC ($16.2k, 1.62×) | same |
+| Rung @ $73,521 | 0.05 BTC ($3.7k) | 0.00752 BTC ($553) | 5.5% both |
+| Rung @ $62,944 | 0.12 BTC ($7.6k) | 0.01806 BTC ($1,137) | 11.4% both |
+| Rung @ $57,860 | 0.20 BTC ($11.6k) | 0.03010 BTC ($1,742) | 17.4% both |
+| **If full ladder fills** | ~1.85 BTC, ~2.9× on shrunken equity | ~0.278 BTC, ~2.9× | **identical risk profile** |
 
 ```mermaid
 flowchart TD
-    A["Leader position<br/>1.336 BTC on $66k equity<br/>= 1.62× leverage"] --> B["× scale (our $10k / his $66k)"]
-    B --> C["Raw target: 0.201 BTC<br/>$16.2k notional"]
-    C --> D{"Notional ≤ MAX_LEVERAGE<br/>× our equity?"}
-    D -- yes --> F["Target = raw target"]
-    D -- no --> E["Clamp to cap<br/>0.186 BTC @ 1.5×"]
-    E --> F
-    F --> G{"|delta| ≥ max(drift 1%,<br/>$10 min notional)?"}
-    G -- no --> H["Skip (dust)"]
-    G -- yes --> I["Send to Risk Gate"]
+    A["Leader ladder event<br/>(place / cancel / fill)"] --> B["Diff his open orders<br/>vs mirror_map"]
+    B --> C["Each new/changed order:<br/>sz × 0.1505, SAME price"]
+    C --> D{"sz ≥ $10 HL min<br/>after rounding?"}
+    D -- no --> E["Skip rung, log it<br/>(account too small for this rung)"]
+    D -- yes --> F["Backstop check (§6):<br/>ladder TOTAL ≤ mirror of his total"]
+    F --> G["Place / cancel to match"]
+    H["60s reconciliation:<br/>position drift > 1%?"] --> I["Taker top-up<br/>(slippage cap 0.15%)"]
 ```
 
 ### 5.2 Sizing rules
 
 | # | Rule | Value (default) | Why |
 |---|---|---|---|
-| S1 | Equity ratio scaling | `our_equity / leader_equity`, live both sides | Same %-of-account exposure as leader — the standard across all referenced bots |
-| S2 | Leverage clamp dominates | `MAX_LEVERAGE = 1.5×` (leader runs ~1.6× and his ladder would push it higher) | We copy his position, **not** his ladder-inflated future leverage |
-| S3 | Min notional | $10 (Hyperliquid rule) + our own `MIN_ORDER_USD = 15` | Avoid dust churn; jestersimpps uses 11 |
-| S4 | Drift threshold | 1% of target position | Don't chase every $ of equity fluctuation |
-| S5 | Max single order | 25% of our equity notional | One bad sync can't dump our full size as one taker order |
-| S6 | Rounding | Always round **down** | Never exceed the computed target |
-| S7 | Increase-throttle | Position increases limited to `MAX_ADD_PER_DAY = 40%` of equity notional per 24h | Caps how fast we follow his average-down cascade in a crash |
+| S1 | Single scale ratio everywhere | `our_equity / leader_equity`, live both sides | Preserves his ladder shape, rung %, and leverage profile exactly |
+| S2 | Mirror his margin config | cross, 3× (as read from his account) | His liquidation math is part of his risk management — copy it |
+| S3 | Min notional | $10 (Hyperliquid rule) | A rung that rounds below $10 is skipped and **logged** — at $10k equity every current rung clears it; below ~$3k equity the small rungs start dropping and the mirror degrades (§15 Q1) |
+| S4 | Drift threshold (reconciliation) | 1% of target position | Don't taker-chase every $ of equity fluctuation |
+| S5 | Rounding | Always round **down** | Never exceed his scaled size |
+| S6 | Scale refresh | Every sync; re-size ladder only when scale moves > 5% | Avoid churning 14 cancel/replaces because equity wiggled 0.3% |
 
-S7 is the direct answer to his martingale ladder: if BTC crashes 28% in a day and all his resting buys fill, a naive copier adds ~40% more exposure into a falling knife within hours. The throttle spreads that across days and gives the drawdown kill-switch (R2) time to fire first.
+There is deliberately **no leverage clamp and no add-throttle** in mirror mode — his ladder-driven leverage path (currently up to ~2.9× if the full ladder fills) is the strategy we chose to copy. The account-level backstops in §6 are the only overrides.
 
 ---
 
-## 6. Risk framework (priority #1, tied)
+## 6. Risk backstops (mirror-faithful)
 
-### 6.1 Hard gates — every order, in order, any failure = veto
+**Philosophy change (v3):** we copy the leader's risk management — pyramid ladder, maker entries, partial distribution, no stops. So the bot has no per-trade risk opinions: no leverage clamp, no add-throttle, no stop-loss overlay by default. What remains are **account-level backstops** that fire only when the *mirror itself* is broken or the account is threatened with destruction — the two things the leader's risk management cannot see from his side.
+
+### 6.1 Hard gates — every order, any failure = veto
 
 ```mermaid
 flowchart TD
-    O[Proposed order] --> R1{"R1 Asset allowlist<br/>BTC only"}
-    R1 -- fail --> V[VETO + alert]
-    R1 --> R2{"R2 Post-trade leverage<br/>≤ 1.5×"}
-    R2 -- fail --> V
-    R2 --> R3{"R3 Post-trade notional<br/>≤ 150% equity"}
-    R3 -- fail --> V
-    R3 --> R4{"R4 Add-throttle<br/>≤ 40% equity / 24h"}
-    R4 -- fail --> V
-    R4 --> R5{"R5 Price sanity<br/>ref price within 1% of mark"}
-    R5 -- fail --> V
-    R5 --> R6{"R6 State fresh<br/>leader data < 5 min old"}
-    R6 -- fail --> V
-    R6 --> R7{"R7 System state<br/>= NORMAL or WARNING"}
-    R7 -- fail --> V
-    R7 --> OK[Approved → Executor]
+    O[Proposed order] --> B1{"B1 Asset allowlist<br/>BTC only"}
+    B1 -- fail --> V[VETO + alert]
+    B1 --> B2{"B2 Mirror parity<br/>our total resting + position<br/>≤ leader total × scale × 1.05"}
+    B2 -- fail --> V
+    B2 --> B3{"B3 Price integrity<br/>mirror order = HIS price;<br/>reconciliation taker within 1% of mark"}
+    B3 -- fail --> V
+    B3 --> B4{"B4 State fresh<br/>leader data < 5 min old"}
+    B4 -- fail --> V
+    B4 --> B5{"B5 System state<br/>= NORMAL or WARNING"}
+    B5 -- fail --> V
+    B5 --> OK[Approved → Executor]
 ```
+
+B2 is the one structural guarantee: **we can never be MORE exposed than the leader, proportionally.** Any bug that would over-mirror gets vetoed there.
 
 ### 6.2 Standing monitors (run continuously, independent of orders)
 
 | # | Monitor | Trigger | Action |
 |---|---|---|---|
-| M1 | **Stop-loss overlay** (leader has none!) | Our position uPnL < **−15%** of equity | Reduce position 50% (maker-first, taker after 90s); repeat at −25% to flat |
-| M2 | **Drawdown kill-switch** | Account equity < **−20%** from high-water mark | → HALT: cancel all orders, flatten, stop copying, require manual restart |
-| M3 | Leader anomaly | Leader position changes > 50% in < 10 min, or flips short | Pause copying (WARNING), alert — his 16 short fills in 9 months were noise, a real flip is regime change |
+| M1 | **Drawdown kill-switch** — the ONE deliberate deviation from the leader | Account equity < **−35%** from high-water mark (wide enough to ride his ladder drawdowns; configurable) | → HALT: cancel all orders, flatten, stop copying, manual restart required |
+| M2 | Connection watchdog | WS silent > 5 min AND poll fails | → WARNING + alert. **Resting mirror orders are KEPT** — they match his standing intent (his are GTC for days); reconcile ladder + position on reconnect |
+| M3 | Leader anomaly | Leader position changes > 50% in < 10 min, or leverage config change | Alert + WARNING (mirror continues — even his short flips are copied now; the alert is for the human, not a brake) |
 | M4 | Funding bleed | Cumulative funding paid > 2% of equity per 30d | Alert only (he paid ~0.6%/mo peak) |
-| M5 | Connection watchdog | WS silent > 5 min AND poll fails | → WARNING: cancel our resting orders (never leave unattended limits), keep position, alert |
-| M6 | Divergence audit | `our_pos / scale` vs `leader_pos` differs > 5% | Force full re-sync; if it persists 3 cycles → WARNING + alert |
+| M5 | Divergence audit | Our ladder or position differs > 5% from `leader × scale` | Force full re-mirror; if it persists 3 cycles → WARNING + alert |
+| M6 | *(optional, OFF by default)* Stop-loss overlay | uPnL < configurable threshold | Available in config for anyone who wants training wheels; default off because the leader trades without stops and that is what we are copying |
 
-### 6.3 Risk state machine (same shape as the option bot's)
+### 6.3 Risk state machine
 
 ```mermaid
 stateDiagram-v2
     [*] --> NORMAL
-    NORMAL --> WARNING: WS lost / leader anomaly / drift persists
+    NORMAL --> WARNING: WS lost / anomaly / drift persists
     WARNING --> NORMAL: condition clears
-    NORMAL --> REDUCING: stop overlay hit (−15%)
-    REDUCING --> NORMAL: position reduced, uPnL recovered
-    WARNING --> HALT: drawdown −20% HWM
-    NORMAL --> HALT: drawdown −20% HWM
-    REDUCING --> HALT: second stop level (−25%)
+    NORMAL --> HALT: drawdown −35% HWM / HALT button
+    WARNING --> HALT: drawdown −35% HWM
     HALT --> [*]: manual restart only
 ```
 
-- **NORMAL** — full copying.
-- **WARNING** — no new *increases*; decreases/closes still mirrored (never block risk reduction).
-- **REDUCING** — stop overlay is working the position down; leader increases ignored.
+- **NORMAL** — full mirror: ladder + position + reconciliation.
+- **WARNING** — no NEW mirror orders; existing ladder kept; closes/cancels still mirrored (never block risk reduction).
 - **HALT** — flat, no orders, manual intervention required. The bot must never auto-exit HALT.
 
 ---
 
 ## 7. Execution
 
-Leader earns his economics by being 84% maker. We approximate:
+Leader earns his economics by being 84% maker — and the order-mirror gives us that for free:
 
-1. Place a **GTC limit at the passive touch** (buy = best bid, sell = best ask).
-2. Unfilled after **90 s** → cancel, re-place crossing the spread as IOC, with slippage cap **0.15%** from mark.
-3. Fill or partial recorded in SQLite; partial remainder handled by the next sync cycle (position-sync makes retries free).
+1. **Mirror orders**: GTC limit at **his exact price** (ALO/post-only where possible). Maker by construction; they fill when his fill.
+2. **Reconciliation top-ups** (his taker trades, missed fills, drift): limit at the passive touch, 90 s, then cross as IOC with slippage cap **0.15%** from mark.
+3. Fills/partials recorded in SQLite; remainders handled by the next reconciliation cycle (retries are free).
 
-Closes triggered by risk monitors (M1/M2) skip step 1 patience: 30 s maker attempt, then taker. Getting out matters more than fee savings.
+HALT flattening (M1 kill-switch or dashboard button) skips the patience: 30 s maker attempt, then taker. Getting out matters more than fee savings.
 
 ---
 
@@ -244,19 +257,18 @@ Closes triggered by risk monitors (M1/M2) skip step 1 patience: 30 s maker attem
 leader: "0xdae4df7207feb3b350e4284c8efe5f7dac37f637"
 assets: ["BTC"]
 
-sizing:
-  mode: equity_ratio          # our_equity / leader_equity
-  max_leverage: 1.5
-  max_notional_pct: 150       # % of equity
-  max_add_per_day_pct: 40
-  min_order_usd: 15
-  drift_threshold_pct: 1.0
-  max_single_order_pct: 25
+mirror:
+  scale: equity_ratio         # our_equity / leader_equity, refreshed each sync
+  copy_orders: true           # mirror his resting ladder (place/cancel/replace)
+  copy_margin_config: true    # adopt his cross-margin 3× setting
+  copy_shorts: true           # mirror everything, including his rare short flips
+  scale_rebalance_pct: 5      # re-size ladder only when scale moves > 5%
+  drift_threshold_pct: 1.0    # reconciliation trigger
 
 risk:
-  stop_loss_upnl_pct: -15     # reduce 50%
-  stop_loss_flat_pct: -25     # go flat
-  max_drawdown_pct: -20       # HALT (from high-water mark)
+  mirror_parity_tolerance: 1.05  # B2: never > leader × scale × this
+  max_drawdown_pct: -35          # M1 kill-switch (the one deviation from him)
+  stop_loss_overlay: null        # M6: off by default = faithful mirror; set e.g. -20 to enable
   leader_staleness_max_s: 300
   funding_alert_pct_30d: 2.0
 
@@ -380,6 +392,13 @@ CREATE TABLE leader_open_orders (
   PRIMARY KEY (snapshot_ts, oid)               -- full ladder re-recorded when it changes
 );
 
+-- The mirror mapping: which of OUR orders mirrors which of HIS (§4.1 diffing)
+CREATE TABLE mirror_map (
+  leader_oid INTEGER PRIMARY KEY, our_oid INTEGER,
+  px REAL, leader_sz REAL, our_sz REAL, scale_used REAL,
+  created_ts INTEGER, closed_ts INTEGER, close_reason TEXT  -- 'his_cancel'|'his_fill'|'rebalance'|'halt'
+);
+
 -- State transitions and alerts (drives the dashboard banner + Telegram)
 CREATE TABLE events (
   id INTEGER PRIMARY KEY, ts INTEGER,
@@ -417,7 +436,7 @@ Runs as a daemon thread inside the bot process (one process = one pid = simple `
 │      ─ ─ ─  leader resting buy ladder (green dashed lines)           │
 │      ─ ─ ─  our resting orders (bright green/red lines)              │
 │      ▲▼ leader fills (solid marker)  △▽ our fills (hollow marker)    │
-│      ───    our stop-overlay levels −15% / −25% (red lines)          │
+│      ───  kill-switch equity level; stop overlay if enabled (red)    │
 │      Order lines: [Off] [Top 4] [Top 8] [All]   Fills: [All][Taker]  │
 ├──────────────────────────────────────────────────────────────────────┤
 │  ACTUAL LEVERAGE % (ours vs leader, signed)               [chart]    │
@@ -434,9 +453,9 @@ Runs as a daemon thread inside the bot process (one process = one pid = simple `
 │  EQUITY CURVE (ours vs leader, indexed to 100)         [chart]       │
 │  DRAWDOWN from HWM  −2.1%   (kill-switch at −20%)      [chart]       │
 ├──────────────────────────────────────────────────────────────────────┤
-│  RISK GATES (last 24h)                                               │
-│  R2 leverage clamp: 2 clamps   R4 add-throttle: 61% of budget used   │
-│  M1 stop overlay: armed, 13.9% away    M4 funding 30d: 0.4% ✓        │
+│  MIRROR HEALTH & BACKSTOPS (last 24h)                                │
+│  Ladder mirrored: 14/14 rungs ✓   parity: 99.7% of leader × scale    │
+│  M1 kill-switch: −2.1% of −35% HWM    M4 funding 30d: 0.4% ✓         │
 ├──────────────────────────────────────────────────────────────────────┤
 │  RECENT DECISIONS                                                    │
 │  12:31:05  poll     Δ+0.005  order   maker filled @ 80,412           │
@@ -548,7 +567,7 @@ Graceful shutdown = cancel all our resting orders → flush SQLite → exit. **T
 flowchart LR
     A[Windows reboot /<br/>python crash] --> B[Orders: GTC limits<br/>still resting on exchange!]
     B --> C[start_copybot.bat<br/>manual or Task Scheduler at logon]
-    C --> D[main.py startup:<br/>1. cancel ALL our open orders<br/>2. read position + HWM from DB<br/>3. full position-sync cycle<br/>4. resume NORMAL]
+    C --> D[main.py startup:<br/>1. cancel ALL our open orders<br/>2. read position + HWM from DB<br/>3. re-mirror his full ladder from scratch<br/>4. position reconciliation cycle<br/>5. resume NORMAL]
 ```
 
 - Startup **always begins by canceling every open order on our account** — never trust orders left by a dead process.
@@ -563,7 +582,7 @@ flowchart LR
 | Phase | Deliverable | Exit criteria |
 |---|---|---|
 | **M1 Shadow** | Watcher + Sizer + Risk Gate in `paper` mode **+ SQLite store + dashboard + daily report + .bat runbook** | 2 weeks running standalone on the VPS; decisions match leader moves; zero crashes; risk vetoes reviewed via dashboard |
-| **M2 Live-small** | Executor live, account funded with **test-size capital only** | 2+ real synced round trips; drift < 1%; maker ≥ 60%; stop overlay fire-drilled on testnet |
+| **M2 Live-small** | Executor live, account funded with **test-size capital only** | Full ladder mirrored (parity ≥ 99%); 2+ rungs filled alongside his as maker; drift < 1%; kill-switch fire-drilled on testnet |
 | **M3 Hardened** | Watchdogs, HALT drill, restart-recovery test (kill -9 mid-sync, reboot test) | Restart converges to correct position with no duplicate orders; stale-pid + startup-cancel verified |
 | **M4 Optional** | Order-ladder mirroring flag, multi-leader, remote dashboard access | Only if M2/M3 economics justify it |
 
@@ -579,10 +598,9 @@ flowchart LR
 
 ## 15. Open questions
 
-1. Copy capital size for M2? (drives whether $10-min-notional rounding is even feasible at scale 0.05 BTC × small ratio)
-2. Should M3 leader-flip-short be copied at all, or is this strictly a long-only mirror? (Default: long-only; shorts ignored.)
-3. Mirror his resting ladder (Phase 2) — worth revisiting only if M2 shows we consistently miss his best maker fills.
-4. Dashboard reachable from outside the VPS (phone)? v1 binds to localhost only; remote access would need auth and is deferred to M4.
+1. Copy capital size for M2? With full ladder mirroring the floor is real: below ~$3k equity his 0.05 BTC rungs round under the $10 minimum and the mirror degrades. $10k mirrors every current rung cleanly.
+2. Dashboard reachable from outside the VPS (phone)? v1 binds to localhost only; remote access would need auth and is deferred to M4.
+3. *(resolved v3)* Short flips and the resting ladder are now copied — full mirror is the product.
 
 ## 16. References
 
