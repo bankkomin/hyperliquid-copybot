@@ -1,0 +1,9 @@
+venv/
+data/
+logs/
+reports/
+config.yaml
+secrets.yaml
+__pycache__/
+*.pyc
+.pytest_cache/

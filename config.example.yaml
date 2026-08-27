@@ -1,0 +1,37 @@
+# Copied to config.yaml on first run by start_copybot.bat.
+# ponytail: no assets list — BTC is hardcoded in the watcher, multi-asset is a PRD non-goal.
+leader: "0xdae4df7207feb3b350e4284c8efe5f7dac37f637"
+mode: paper                   # paper | live — paper is ALWAYS the shipped default
+
+mirror:
+  copy_orders: true           # mirror his resting ladder (place/cancel/replace)
+  copy_shorts: true           # mirror everything, including his rare short flips
+  scale_rebalance_pct: 5      # re-size ladder only when scale moves > 5%
+  drift_threshold_pct: 1.0    # reconciliation trigger
+
+risk:
+  mirror_parity_tolerance: 1.05  # B2: never > leader x scale x this
+  max_drawdown_pct: -35          # M1 kill-switch (the one deviation from the leader)
+  stop_loss_overlay: null        # M6: off by default = faithful mirror
+  leader_staleness_max_s: 300
+  funding_alert_pct_30d: 2.0
+
+execution:
+  maker_wait_s: 90
+  taker_slippage_cap_pct: 0.15
+
+storage:
+  db_path: "data/copybot.db"
+  snapshot_interval_s: 60
+
+dashboard:
+  port: 8061
+  refresh_s: 15
+
+paper:
+  start_equity: 10000
+
+telegram:
+  enabled: false
+  bot_token: ""
+  chat_id: ""

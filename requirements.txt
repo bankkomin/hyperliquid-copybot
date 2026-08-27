@@ -1,0 +1,8 @@
+hyperliquid-python-sdk
+dash
+plotly
+pydantic>=2
+structlog
+pyyaml
+aiohttp
+pytest
