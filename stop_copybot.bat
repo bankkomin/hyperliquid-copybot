@@ -7,7 +7,7 @@ rem window to receive WM_CLOSE, so taskkill can only force-kill and any
 rem finally-block cleanup would never run.
 cd /d %~dp0
 
-if not exist logs\copybot.pid ( echo Not running. & pause & exit /b 0 )
+if not exist logs\copybot.pid ( echo Not running. & ping -n 4 127.0.0.1 >nul & exit /b 0 )
 set /p PID=<logs\copybot.pid
 
 echo Requesting graceful shutdown...
@@ -21,7 +21,7 @@ rem The bot polls every 2s and cancels its resting orders before exiting.
 for /l %%i in (1,1,20) do (
   tasklist /fi "PID eq %PID%" 2>nul | find "%PID%" >nul
   if errorlevel 1 goto :done
-  timeout /t 2 >nul
+  ping -n 3 127.0.0.1 >nul
 )
 
 :force
@@ -31,4 +31,5 @@ taskkill /f /pid %PID% >nul 2>&1
 :done
 del logs\copybot.pid 2>nul
 echo Copybot stopped. Any open position is UNMANAGED until you start it again.
-pause
+rem `pause` would block an unattended run forever; bounded wait instead.
+ping -n 6 127.0.0.1 >nul

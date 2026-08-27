@@ -23,7 +23,7 @@ def test_readonly_db_cannot_write(tmp_path):
     db = ReadOnlyDB(str(tmp_path / "t.db"))
     assert db.q("SELECT COUNT(*) FROM events") == [(0,)]
     # a write through the read-only handle must fail, not corrupt state
-    assert db.q("INSERT INTO events(ts,level,kind,message) VALUES (1,'x','y','z')") == []
+    assert db.q("INSERT INTO events(ts,level,kind,message) VALUES (1,'x','y','z')") is None
     assert db.q("SELECT COUNT(*) FROM events") == [(0,)]
 
 
@@ -37,6 +37,14 @@ def test_halt_button_writes_one_consumable_row(tmp_path):
     assert st.halt_requested() is False  # consumed by the state change
 
 
-def test_missing_db_returns_empty_not_crash(tmp_path):
+def test_failed_read_is_unknown_not_a_green_normal(tmp_path):
+    """Regression: a locked/unreadable DB returned [] and painted a reassuring
+    green NORMAL banner over an account that could be halted and deep in
+    drawdown."""
+    from src.dashboard import resolve_state
+
     db = ReadOnlyDB(str(tmp_path / "nope.db"))
-    assert db.q("SELECT 1") == []
+    assert db.q("SELECT 1 FROM events") is None  # failure, not emptiness
+    assert db.rows("SELECT 1 FROM events") == []  # display panels degrade quietly
+    assert resolve_state(None) == "UNKNOWN"
+    assert resolve_state([]) == "NORMAL"

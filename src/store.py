@@ -179,6 +179,14 @@ class Store:
         self.conn.commit()
         return new != cur
 
+    def last_mark(self) -> float:
+        """Most recent BTC mark we recorded. Last-resort price for a HALT
+        flatten after a restart, when nothing else is reachable."""
+        row = self.conn.execute(
+            "SELECT mark_px FROM snapshots WHERE mark_px > 0 ORDER BY ts DESC LIMIT 1"
+        ).fetchone()
+        return row[0] if row else 0.0
+
     def stop_requested(self) -> bool:
         """stop_copybot.bat asks for a graceful stop through the DB, not a signal:
         pythonw has no window to receive WM_CLOSE, so taskkill can only force-kill

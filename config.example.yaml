@@ -17,7 +17,6 @@ risk:
   funding_alert_pct_30d: 2.0
 
 execution:
-  maker_wait_s: 90
   taker_slippage_cap_pct: 0.15
 
 storage:

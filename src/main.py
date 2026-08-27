@@ -35,7 +35,6 @@ class Deps:
     broker: object
     last_leader: AccountState | None = None  # staleness baseline across cycles
     last_fill_ts: int = 0
-    _last_report_day: str = ""
 
 
 def _record_leader_orders(store: Store, orders, now_ms: int) -> None:
@@ -171,15 +170,47 @@ def _enforce_halt(deps: Deps, ours: AccountState, mark_px: float, now_ms: int) -
     return clean
 
 
+async def _halt_cycle(deps: Deps, now_ms: int) -> None:
+    """One cycle while HALTED: keep the operator's view alive and keep pushing
+    the account toward flat.
+
+    The mark price is sourced independently of the leader: after a restart
+    `last_leader` is None, and an earlier version took the price from there —
+    which meant a HALT that survived a reboot could never flatten.
+    """
+    mark = 0.0
+    try:
+        mark = await deps.watcher.fetch_mark()
+    except Exception:
+        log.warning("halt_mark_fetch_failed")
+    if not mark:
+        mark = (deps.last_leader.mark_px if deps.last_leader else 0.0) or deps.store.last_mark()
+
+    ours = deps.broker.state(mark, now_ms)
+    # Keep writing snapshots/equity: otherwise every operator-facing surface
+    # freezes at its pre-HALT values, and the person deciding whether the HALT
+    # worked is reading numbers from before it.
+    deps.store.record_snapshot("copy", ours)
+    deps.store.update_equity(now_ms, ours.equity)
+    if ours.position or not deps.broker.book_is_clean():
+        _enforce_halt(deps, ours, mark, now_ms)
+
+
 async def cycle(deps: Deps, now_ms: int) -> None:
-    # HALT enforcement runs FIRST and never depends on the leader API: flattening
-    # our own account has nothing to do with his data, and the leader endpoint is
-    # most likely to be degraded during the crash that caused the HALT.
-    if RiskState(deps.store.latest_risk_state()) == RiskState.HALT:
-        mark = deps.last_leader.mark_px if deps.last_leader else 0.0
-        ours = deps.broker.state(mark, now_ms)
-        if ours.position or not deps.broker.book_is_clean():
-            _enforce_halt(deps, ours, mark, now_ms)
+    # The dashboard HALT button is read FIRST, before anything that can fail:
+    # the operator presses it precisely when things are going wrong, so it must
+    # not depend on the leader API being reachable.
+    entry_state = RiskState(deps.store.latest_risk_state())
+    if entry_state != RiskState.HALT and deps.store.halt_requested():
+        deps.store.record_event(now_ms, "critical", "state_change", RiskState.HALT.value)
+        deps.store.record_event(now_ms, "critical", "monitor", "halt_requested from dashboard")
+        entry_state = RiskState.HALT
+
+    # HALT enforcement also runs before the leader fetch: flattening our own
+    # account has nothing to do with his data, and his endpoint is most likely
+    # degraded during the crash that caused the HALT.
+    if entry_state == RiskState.HALT:
+        await _halt_cycle(deps, now_ms)
         return
 
     fetched = await _fetch_leader(deps, now_ms)
@@ -209,8 +240,6 @@ async def cycle(deps: Deps, now_ms: int) -> None:
         else 0.0
     )
     new_state, alerts = run_monitors(dd, age_s, state, deps.cfg, upnl_pct)
-    if state != RiskState.HALT and deps.store.halt_requested():
-        new_state, alerts = RiskState.HALT, ["halt_requested from dashboard"]
     if new_state != state:
         deps.store.record_event(
             now_ms,
@@ -325,6 +354,12 @@ async def cycle(deps: Deps, now_ms: int) -> None:
         deps.store.record_decision(
             now_ms, "poll", "skip_dust", state.value, leader_pos=leader.position, scale=scale
         )
+
+    # Re-record our snapshot AFTER this cycle's fills. The earlier one is the
+    # pre-trade state the risk gates are judged against; leaving it as the last
+    # word made the dashboard and daily report show a position one cycle stale
+    # (e.g. "0.00000 BTC, drift -100%" right after a reconciliation bought in).
+    deps.store.record_snapshot("copy", deps.broker.state(leader.mark_px, now_ms))
 
 
 def make_broker(cfg: Config, store: Store):

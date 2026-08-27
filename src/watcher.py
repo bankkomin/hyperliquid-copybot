@@ -51,6 +51,13 @@ class Watcher:
             mids = await self._info(s, {"type": "allMids"})
         return parse_clearinghouse(ch, oo, float(mids["BTC"]), now_ms)
 
+    async def fetch_mark(self) -> float:
+        """BTC mark price alone. HALT needs a price to flatten at, and it must
+        not depend on the leader's account data being reachable."""
+        async with aiohttp.ClientSession() as s:
+            mids = await self._info(s, {"type": "allMids"})
+        return float(mids["BTC"])
+
     async def fetch_fills(self, since_ms: int) -> list[dict]:
         """Raw fills since `since_ms`. This is how the cycle distinguishes a
         leader FILL from a leader CANCEL — both make his order disappear."""

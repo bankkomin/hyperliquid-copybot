@@ -22,7 +22,6 @@ class Risk(BaseModel):
 
 
 class Execution(BaseModel):
-    maker_wait_s: int = 90
     taker_slippage_cap_pct: float = 0.15
 
 

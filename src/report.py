@@ -4,7 +4,6 @@ ponytail: text and tables only — no inline chart image, the dashboard already
 charts equity and a PNG would drag in a kaleido dependency.
 """
 
-import json
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -24,7 +23,7 @@ def _day_bounds_ms(day: str) -> tuple[int, int]:
     return lo, lo + 86_400_000
 
 
-def render_daily(store: Store, day: str, cfg: Config | None = None) -> tuple[str, str]:
+def render_daily(store: Store, day: str, cfg: Config) -> tuple[str, str]:
     lo, hi = _day_bounds_ms(day)
     q = store.conn.execute
 
@@ -61,7 +60,7 @@ def render_daily(store: Store, day: str, cfg: Config | None = None) -> tuple[str
     maker_pct = 100.0 * (n_fills - takers) / n_fills if n_fills else 0.0
     day_pct = (ours[0] / day_open[0] - 1) * 100 if day_open[0] else 0.0
     veto_txt = ", ".join(f"{r or 'n/a'} x{c}" for r, c in vetoes) or "none"
-    mode = (cfg.mode if cfg else "paper").upper()
+    mode = cfg.mode.upper()
 
     # Copy-quality metrics — PRD 11.3/14 make these the M1->M2 go/no-go numbers.
     leader_eq = q(
@@ -76,14 +75,26 @@ def render_daily(store: Store, day: str, cfg: Config | None = None) -> tuple[str
         (hi - 7 * 86_400_000,)
     ).fetchone()
     maker_7d = 100.0 * (week[0] - week[1]) / week[0] if week[0] else 0.0
+    # Lag = how long after HIS fill ours landed. Match each of our fills to the
+    # most recent leader fill at that price within an hour; without the time
+    # bound this averages the age of every historical fill at a repeated rung
+    # price and grows without limit.
     lag = q(
-        "SELECT AVG(f.ts - lf.ts)/1000.0 FROM fills f JOIN leader_fills lf "
-        "ON ABS(f.px - lf.px) < 0.5 WHERE f.ts>=? AND f.ts<?", (lo, hi)
+        "SELECT AVG(lag)/1000.0 FROM ("
+        "  SELECT f.ts - (SELECT MAX(lf.ts) FROM leader_fills lf"
+        "                 WHERE ABS(lf.px - f.px) < 0.5"
+        "                   AND lf.ts <= f.ts AND lf.ts >= f.ts - 3600000) AS lag"
+        "  FROM fills f WHERE f.ts>=? AND f.ts<? AND f.crossed=0"
+        ") WHERE lag IS NOT NULL", (lo, hi)
     ).fetchone()
     lag_s = lag[0] if lag and lag[0] is not None else 0.0
-    funding = q(
-        "SELECT COALESCE(MAX(funding_cum),0) FROM equity_curve WHERE ts<?", (hi,)
-    ).fetchone()[0]
+    # LATEST row, not MAX: funding paid is negative and unwritten rows default
+    # to 0, so MAX() reports $0.00 no matter how much carry the position bled.
+    funding_row = q(
+        "SELECT funding_cum FROM equity_curve WHERE ts<? AND funding_cum != 0 "
+        "ORDER BY ts DESC LIMIT 1", (hi,)
+    ).fetchone()
+    funding = funding_row[0] if funding_row else 0.0
 
     tg = (
         f"Copybot daily - {day} ({mode})\n"
@@ -149,12 +160,3 @@ def write_daily(store: Store, day: str, cfg: Config) -> Path:
     log.info("daily_report_written", path=str(out))
     return out
 
-
-if __name__ == "__main__":  # smoke check against the live DB
-    import sys
-
-    from src.config import load_config
-
-    c = load_config("config.yaml")
-    d = sys.argv[1] if len(sys.argv) > 1 else datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    print(json.dumps({"path": str(write_daily(Store(c.storage.db_path), d, c))}))

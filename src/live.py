@@ -25,7 +25,6 @@ PX_DECIMALS = 0  # BTC perp trades in whole dollars on Hyperliquid
 class LiveBroker:
     def __init__(self, exchange, info, address: str, store: Store):
         self.ex, self.info, self.address, self.store = exchange, info, address, store
-        self._last_fill_ts = 0
 
     # ---- order plumbing -------------------------------------------------
     def _oid(self, resp) -> int | None:
@@ -62,16 +61,16 @@ class LiveBroker:
         if isinstance(s, dict) and "error" in s:
             log.warning("cancel_rejected", oid=oid, detail=str(s)[:200])
             return False
+        # Mark it locally too: the dashboard reads `orders` for our ladder, and a
+        # row left 'open' after a HALT shows the operator a book that is gone.
+        self.store.conn.execute("UPDATE orders SET status='canceled' WHERE oid=?", (oid,))
+        self.store.conn.commit()
         return True
 
     def execute(self, a: MirrorAction, now_ms: int) -> int | None:
         if a.kind == "cancel":
             if not self._cancel_ok(a.our_oid):
                 return None  # caller must NOT close the mirror row
-            self.store.conn.execute(
-                "UPDATE orders SET status='canceled' WHERE oid=?", (a.our_oid,)
-            )
-            self.store.conn.commit()
             return a.our_oid
 
         # A transport timeout on an accepted order would otherwise be retried

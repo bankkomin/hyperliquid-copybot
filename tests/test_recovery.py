@@ -68,6 +68,63 @@ def test_halt_is_enforced_even_when_the_leader_api_is_down(tmp_path, cfg_paper, 
     assert deps.broker.open == {}
 
 
+def test_halt_flattens_after_restart_without_a_leader_baseline(tmp_path, cfg_paper, make_deps):
+    """Regression: the HALT path took its mark price from deps.last_leader, which
+    is None after a restart — so a HALT that survived a reboot could never
+    flatten, and logged halt_incomplete forever."""
+    st = Store(tmp_path / "t.db")
+    deps = make_deps(st, FakeWatcher(leader_state(position=0.0)))
+    asyncio.run(cycle(deps, now_ms=1000))  # records a mark in snapshots
+    deps.broker.market_fill("B", 0.05, 79_660, 1500)
+    st.record_event(1600, "critical", "state_change", "HALT")
+
+    # Simulate the restart: fresh Deps, no last_leader, leader API unreachable.
+    deps2 = make_deps(Store(tmp_path / "t.db"), FakeWatcher(leader_state(position=0.0)))
+
+    async def boom(*_a, **_k):
+        raise ConnectionError
+
+    deps2.watcher.fetch = boom
+    deps2.watcher.fetch_mark = boom
+    assert deps2.last_leader is None
+    asyncio.run(cycle(deps2, now_ms=2000))
+    assert deps2.broker.position == 0.0  # flattened off the last recorded mark
+
+
+def test_dashboard_halt_button_works_while_the_leader_api_is_down(tmp_path, cfg_paper, make_deps):
+    """Regression: halt_requested was only read below the leader-fetch guard, so
+    the manual kill switch was ignored during exactly the outage it exists for."""
+    st = Store(tmp_path / "t.db")
+    deps = make_deps(st, FakeWatcher(leader_state(position=0.0)))
+    asyncio.run(cycle(deps, now_ms=1000))
+    deps.broker.market_fill("B", 0.05, 79_660, 1500)
+
+    async def boom(*_a, **_k):
+        raise ConnectionError
+
+    deps.watcher.fetch = boom
+    deps.watcher.fetch_mark = boom
+    st.record_event(1600, "critical", "halt_requested", "dashboard button")
+    asyncio.run(cycle(deps, now_ms=2000))
+    assert st.latest_risk_state() == "HALT"
+    assert deps.broker.position == 0.0
+
+
+def test_halt_keeps_writing_snapshots(tmp_path, cfg_paper, make_deps):
+    """Regression: the HALT path returned before recording anything, so every
+    operator surface froze at its pre-HALT values."""
+    st = Store(tmp_path / "t.db")
+    deps = make_deps(st, FakeWatcher(leader_state(position=0.0)))
+    asyncio.run(cycle(deps, now_ms=1000))
+    st.record_event(1600, "critical", "state_change", "HALT")
+    before = st.conn.execute("SELECT COUNT(*) FROM snapshots WHERE who='copy'").fetchone()[0]
+    asyncio.run(cycle(deps, now_ms=2000))
+    asyncio.run(cycle(deps, now_ms=3000))
+    after = st.conn.execute("SELECT COUNT(*) FROM snapshots WHERE who='copy'").fetchone()[0]
+    assert after > before  # the dashboard keeps updating during a HALT
+    assert st.conn.execute("SELECT COUNT(*) FROM equity_curve").fetchone()[0] >= 3
+
+
 def test_startup_keeps_mirror_rows_when_the_book_is_not_verifiably_clean(tmp_path, cfg_live):
     """Regression: wiping rows we did not confirm cancelled orphans live orders
     while the first cycle re-places the same rungs — double size, half unmanaged."""

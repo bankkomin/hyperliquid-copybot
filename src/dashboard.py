@@ -18,7 +18,7 @@ from src.config import Config
 
 GREEN, RED = "rgb(38, 166, 91)", "rgb(214, 69, 65)"
 BG, PANEL, TEXT, MUTED = "#0d1117", "#161b22", "#e6edf3", "#8b949e"
-STATE_COLORS = {"NORMAL": GREEN, "WARNING": "#d4a72c", "HALT": RED}
+STATE_COLORS = {"NORMAL": GREEN, "WARNING": "#d4a72c", "HALT": RED, "UNKNOWN": RED}
 
 _candle_cache: dict = {"ts": 0.0, "data": []}
 CANDLE_TTL_S = 60
@@ -79,7 +79,13 @@ class ReadOnlyDB:
     def __init__(self, path: str):
         self.path = path
 
-    def q(self, sql: str, args=()) -> list[tuple]:
+    def q(self, sql: str, args=()) -> list[tuple] | None:
+        """Rows, or None when the read FAILED.
+
+        None and [] must stay distinguishable: a locked database returning []
+        would paint a green NORMAL banner with 0.0% drawdown over an account
+        that could be halted and deep in drawdown.
+        """
         try:
             conn = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True, timeout=5)
             try:
@@ -87,7 +93,11 @@ class ReadOnlyDB:
             finally:
                 conn.close()
         except sqlite3.Error:
-            return []
+            return None
+
+    def rows(self, sql: str, args=()) -> list[tuple]:
+        """Rows for display panels, where empty and unreadable look the same."""
+        return self.q(sql, args) or []
 
     def request_halt(self, ts_ms: int) -> None:
         """The dashboard's ONLY write. The bot consumes it on the next cycle."""
@@ -136,7 +146,12 @@ def _table(headers, rows):
 
 def resolve_state(rows) -> str:
     """Same rule as store.latest_risk_state, applied to a read-only query result:
-    a manual_reset row means an operator cleared the HALT."""
+    a manual_reset row means an operator cleared the HALT.
+
+    `None` means the query failed — report UNKNOWN, never a reassuring NORMAL.
+    """
+    if rows is None:
+        return "UNKNOWN"
     if not rows:
         return "NORMAL"
     kind, message = rows[0][0], rows[0][1]
@@ -144,7 +159,7 @@ def resolve_state(rows) -> str:
 
 
 def _snapshot(db: ReadOnlyDB, who: str):
-    rows = db.q(
+    rows = db.rows(
         "SELECT equity, position_btc, entry_px, upnl, leverage, mark_px FROM snapshots "
         "WHERE who=? ORDER BY ts DESC LIMIT 1",
         (who,),
@@ -162,13 +177,13 @@ def build_view(db: ReadOnlyDB, cfg: Config):
         )
     )
 
-    last_ts = db.q("SELECT MAX(ts) FROM snapshots")
+    last_ts = db.rows("SELECT MAX(ts) FROM snapshots")
     age_s = (time.time() * 1000 - (last_ts[0][0] or 0)) / 1000 if last_ts and last_ts[0][0] else 0
 
     # Pending orders of BOTH accounts — the overlay source. leader_ladder_live is
     # rewritten every cycle, so an emptied ladder actually disappears here.
-    leader_orders = db.q("SELECT side, px, sz FROM leader_ladder_live ORDER BY px DESC")
-    our_orders = db.q("SELECT side, px, sz FROM orders WHERE status='open' ORDER BY px DESC")
+    leader_orders = db.rows("SELECT side, px, sz FROM leader_ladder_live ORDER BY px DESC")
+    our_orders = db.rows("SELECT side, px, sz FROM orders WHERE status='open' ORDER BY px DESC")
     overlay = [("leader", s, p, z) for s, p, z in leader_orders]
     overlay += [("ours", s, p, z) for s, p, z in our_orders]
 
@@ -203,7 +218,7 @@ def build_view(db: ReadOnlyDB, cfg: Config):
         )
     shapes, annotations = order_overlay_shapes(overlay)
     for f_who, marker in (("leader_fills", "triangle-up"), ("fills", "triangle-up-open")):
-        fills = db.q(f"SELECT ts, px, side FROM {f_who} ORDER BY ts DESC LIMIT 200")
+        fills = db.rows(f"SELECT ts, px, side FROM {f_who} ORDER BY ts DESC LIMIT 200")
         if fills:
             fig.add_trace(
                 go.Scatter(
@@ -224,7 +239,7 @@ def build_view(db: ReadOnlyDB, cfg: Config):
         title="BTC price - candles (Hyperliquid) with pending-order overlay",
     )
 
-    curve = db.q("SELECT ts, equity, drawdown_pct FROM equity_curve ORDER BY ts")
+    curve = db.rows("SELECT ts, equity, drawdown_pct FROM equity_curve ORDER BY ts")
     eq_fig = go.Figure()
     if curve:
         eq_fig.add_trace(
@@ -262,7 +277,7 @@ def build_view(db: ReadOnlyDB, cfg: Config):
         style={"display": "flex", "gap": 12, "marginBottom": 12},
     )
 
-    decisions = db.q(
+    decisions = db.rows(
         "SELECT ts, trigger, action, veto_reason, risk_state FROM decisions "
         "ORDER BY id DESC LIMIT 15"
     )

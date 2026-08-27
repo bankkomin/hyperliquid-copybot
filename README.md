@@ -116,10 +116,14 @@ data/copybot.db                        SQLite: the single source of truth
 logs/copybot.jsonl                     structured logs, rotated daily
 reports/daily-YYYYMMDD.html            daily reports
 src/  watcher sizer risk paper live executor store dashboard report main
-tests/                                 107 tests
+tests/                                 112 tests
 ```
 
 Run the tests with:
+
+```bash
+venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+```
 
 ```bash
 venv\Scripts\python.exe -m pytest tests/ -q

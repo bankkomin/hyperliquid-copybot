@@ -33,6 +33,38 @@ def test_report_on_empty_day_does_not_crash(tmp_path, cfg_paper):
     assert "Copybot daily" in tg and "<table>" in html
 
 
+def test_fill_lag_is_bounded_to_the_matching_fill(tmp_path, cfg_paper):
+    """Regression: the join had no time bound, so after weeks of laddering at
+    repeated rung prices it averaged the age of the whole leader fill history."""
+    st = Store(tmp_path / "t.db")
+    old = TS - 10 * 86_400_000  # his fill at the same price ten days ago
+    for ts in (old, TS + 1000):
+        st.conn.execute(
+            "INSERT INTO leader_fills VALUES (?,?,'B',57860.0,0.2,0,'Open Long')",
+            (ts, ts),
+        )
+    st.conn.execute(
+        "INSERT INTO fills(oid,ts,side,px,sz,crossed,closed_pnl,fee)"
+        " VALUES (1,?,'B',57860.0,0.03,0,0,0.1)",
+        (TS + 9000,),  # ours landed 8s after his
+    )
+    st.conn.commit()
+    _, tg = render_daily(st, DAY, cfg_paper)
+    assert "fill lag 8s" in tg  # not 864,000s
+
+
+def test_funding_reports_the_latest_value_not_max(tmp_path, cfg_paper):
+    """Regression: funding paid is negative and unwritten rows default to 0, so
+    MAX() reported $0.00 no matter how much carry the position bled."""
+    st = Store(tmp_path / "t.db")
+    st.update_equity(TS + 1000, 10_000)  # funding_cum defaults to 0
+    st.update_equity(TS + 2000, 9_900)
+    st.conn.execute("UPDATE equity_curve SET funding_cum=-412.75 WHERE ts=?", (TS + 2000,))
+    st.conn.commit()
+    _, tg = render_daily(st, DAY, cfg_paper)
+    assert "funding $-412.75" in tg
+
+
 def test_maker_percentage_counts_takers(tmp_path, cfg_paper):
     st = Store(tmp_path / "t.db")
     for crossed in (0, 0, 0, 1):  # 3 maker, 1 taker
