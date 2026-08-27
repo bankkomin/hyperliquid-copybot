@@ -1,6 +1,6 @@
 # PRD — Hyperliquid Copybot for `0xdae4...7637` ("Paul Wei")
 
-**Status:** Draft v3.1 · 2026-08-27
+**Status:** Draft v3.2 · 2026-08-27
 **Repo:** `bankkomin/hyperliquid-copybot`
 **Leader:** [`0xdae4df7207feb3b350e4284c8efe5f7dac37f637`](https://hyperbot.network/trader/0xdae4df7207feb3b350e4284c8efe5f7dac37f637) — BTC perp only, tracked at [paul.catseye.today](https://paul.catseye.today/)
 
@@ -304,11 +304,12 @@ Match the option bot's conventions — same developer, same review muscle memory
 
 ```
 hyperliquid-copybot/
-├── start_copybot.bat       # double-click: bot + dashboard in background, opens browser
+├── start_copybot.bat       # double-click: auto-installs venv+deps if needed, runs bot + dashboard, opens browser
 ├── stop_copybot.bat        # double-click: clean shutdown
-├── config.yaml
+├── config.example.yaml     # committed template; copied to config.yaml on first run (mode: paper)
+├── config.yaml             # local, not committed
 ├── requirements.txt
-├── venv/                   # local venv (not committed)
+├── venv/                   # created by start_copybot.bat (not committed; .installed marker tracks deps)
 ├── data/
 │   └── copybot.db          # SQLite — the single source of truth
 ├── logs/
@@ -530,11 +531,33 @@ The **copy-quality metrics** (maker %, fill lag vs leader's fill time, tracking 
 
 ## 12. Standalone operation (double-click run)
 
-### 12.1 `start_copybot.bat`
+### 12.1 `start_copybot.bat` — self-bootstrapping
+
+One file does everything: first double-click installs, every double-click after that just runs. No manual `pip install`, no README setup steps.
 
 ```bat
 @echo off
 cd /d %~dp0
+
+rem ---------- auto-setup (first run, or when requirements.txt changed) ----------
+if not exist venv\Scripts\python.exe (
+  echo [setup] Creating virtual environment...
+  py -3 -m venv venv 2>nul || python -m venv venv
+  if not exist venv\Scripts\python.exe ( echo [setup] FAILED: install Python 3.10+ from python.org & pause & exit /b 1 )
+)
+fc /b requirements.txt venv\.installed >nul 2>&1
+if errorlevel 1 (
+  echo [setup] Installing dependencies...
+  venv\Scripts\python.exe -m pip install --upgrade pip --quiet
+  venv\Scripts\python.exe -m pip install -r requirements.txt --quiet || ( echo [setup] pip install FAILED & pause & exit /b 1 )
+  copy /y requirements.txt venv\.installed >nul
+)
+if not exist config.yaml copy config.example.yaml config.yaml >nul
+if not exist logs mkdir logs
+if not exist data mkdir data
+if not exist reports mkdir reports
+
+rem ---------- launch ----------
 if exist logs\copybot.pid (
   echo Copybot already running (logs\copybot.pid exists). Use stop_copybot.bat first.
   pause & exit /b 1
@@ -544,9 +567,14 @@ timeout /t 4 >nul
 start http://localhost:8061
 ```
 
+- **Auto-install**: creates the venv and pip-installs `requirements.txt` on first run; re-installs automatically whenever `requirements.txt` changes (tracked via the `venv\.installed` marker copy). Creates `config.yaml` from `config.example.yaml` and the `logs/`, `data/`, `reports/` folders if missing — so a fresh `git clone` + double-click is a complete setup.
+- Uses the `py -3` launcher first, falling back to `python` — this dodges the machine's hijacked bare-`python` PATH problem, and after the venv exists every call is by explicit `venv\Scripts\...` path anyway.
+- The only manual prerequisite is Python 3.10+ itself being installed; the .bat says so and stops cleanly if it's absent.
+- `requirements.txt` (v1): `hyperliquid-python-sdk`, `dash`, `plotly`, `pydantic`, `structlog`, `pyyaml`, `websockets`, `aiohttp`.
 - `pythonw.exe` → **no console window**; the process lives in the background, all output goes to `logs/copybot.jsonl`.
 - `main.py` writes `logs/copybot.pid` on startup and removes it on clean exit; the stale-pid check stops double-starts (two bots = double orders).
 - After 4 s the default browser opens straight to the dashboard.
+- First-ever run starts in `mode: paper` (from `config.example.yaml`) — auto-setup can never accidentally boot a live-trading bot; going live is a deliberate config edit.
 
 ### 12.2 `stop_copybot.bat`
 
