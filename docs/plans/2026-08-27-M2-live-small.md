@@ -78,6 +78,28 @@ def test_cancel_all_cancels_every_open_order():
     b.info.open_orders.return_value = [{"coin": "BTC", "oid": 1}, {"coin": "BTC", "oid": 2}]
     assert b.cancel_all() == 2
     assert ex.cancel.call_count == 2
+
+def test_cancel_all_survives_one_failing_cancel():
+    b, ex = broker()
+    b.info.open_orders.return_value = [{"coin": "BTC", "oid": n} for n in (1, 2, 3)]
+    ex.cancel.side_effect = [None, ConnectionError("429"), None]
+    assert b.cancel_all() == 2                   # confirmed cancels, not attempts
+    assert ex.cancel.call_count == 3             # kept going past the failure
+
+def test_rejected_alo_returns_none_not_phantom_oid():
+    b, ex = broker()
+    ex.order.return_value = {"status": "ok", "response": {"data": {"statuses": [
+        {"error": "Post only order would have immediately matched"}]}}}
+    oid = b.execute(MirrorAction(kind="place", side="B", px=80_100.0,
+                                 sz=0.01, leader_oid=1), now_ms=1)
+    assert oid is None                           # cycle must NOT mirror_put on None
+
+def test_top_level_err_returns_none():
+    b, ex = broker()
+    ex.order.return_value = {"status": "err", "response": "Insufficient margin"}
+    oid = b.execute(MirrorAction(kind="place", side="B", px=70_000.0,
+                                 sz=0.01, leader_oid=1), now_ms=1)
+    assert oid is None
 ```
 
 - [ ] **Step 2: Run** — `venv\Scripts\python.exe -m pytest tests/test_live.py -v` → FAIL `ModuleNotFoundError`
@@ -89,15 +111,25 @@ def test_cancel_all_cancels_every_open_order():
 from src.models import AccountState, MirrorAction
 from src.watcher import parse_clearinghouse
 
+import structlog
+log = structlog.get_logger(__name__)
+
 class LiveBroker:
     def __init__(self, exchange, info, address: str):
         self.ex, self.info, self.address = exchange, info, address
 
-    def _oid(self, resp) -> int:
+    def _oid(self, resp) -> int | None:
+        """None = rejected. Callers must skip mirror_put/decision-success on None."""
+        if resp.get("status") != "ok":                 # top-level err: response is a string
+            log.warning("order_rejected", detail=str(resp.get("response")))
+            return None
         s = resp["response"]["data"]["statuses"][0]
-        return s.get("resting", s.get("filled", {})).get("oid", 0)
+        if "error" in s:                               # e.g. ALO would have crossed
+            log.warning("order_rejected", detail=s["error"])
+            return None
+        return s.get("resting", s.get("filled", {})).get("oid")
 
-    def execute(self, a: MirrorAction, now_ms: int) -> int:
+    def execute(self, a: MirrorAction, now_ms: int) -> int | None:
         if a.kind == "cancel":
             self.ex.cancel("BTC", a.our_oid)
             return a.our_oid
@@ -106,17 +138,24 @@ class LiveBroker:
         return self._oid(resp)
 
     def taker(self, side: str, sz: float, mark_px: float,
-              slippage_cap_pct: float) -> int:
+              slippage_cap_pct: float) -> int | None:
         cap = mark_px * (1 + slippage_cap_pct / 100 * (1 if side == "B" else -1))
         resp = self.ex.order(name="BTC", is_buy=side == "B", sz=sz,
                              limit_px=round(cap), order_type={"limit": {"tif": "Ioc"}})
         return self._oid(resp)
 
     def cancel_all(self) -> int:
+        """Safety-critical (kill-switch, startup): isolate per-order errors,
+        return CONFIRMED cancels only. Caller re-runs next cycle if short."""
         oo = [o for o in self.info.open_orders(self.address) if o["coin"] == "BTC"]
+        ok = 0
         for o in oo:
-            self.ex.cancel("BTC", o["oid"])
-        return len(oo)
+            try:
+                self.ex.cancel("BTC", o["oid"])
+                ok += 1
+            except Exception:
+                log.exception("cancel_failed", oid=o["oid"])
+        return ok
 
     def state(self, mark_px: float, now_ms: int) -> AccountState:
         ch = self.info.user_state(self.address)
@@ -129,7 +168,7 @@ class LiveBroker:
 api_wallet_key: "0x..."   # Hyperliquid API wallet (agent) key — NOT the main wallet key
 ```
 
-- [ ] **Step 4: Run** — `venv\Scripts\python.exe -m pytest tests/test_live.py -v` → PASS (3 tests)
+- [ ] **Step 4: Run** — `venv\Scripts\python.exe -m pytest tests/test_live.py -v` → PASS (6 tests)
 - [ ] **Step 5: Commit** — `git add src/live.py secrets.example.yaml .gitignore tests/test_live.py && git commit -m "feat: live broker — ALO mirror orders, capped IOC taker, cancel_all"`
 
 ---
@@ -145,6 +184,9 @@ api_wallet_key: "0x..."   # Hyperliquid API wallet (agent) key — NOT the main 
 - Produces: `make_broker(cfg, store) -> PaperBroker | LiveBroker` — `live` mode raises `SystemExit` if `secrets.yaml` missing. Cycle gains: after ladder diff, if `position_delta(...) != 0` → `check_order` → `broker.taker(...)`, decision-logged with trigger `reconcile`.
 - B3 in `check_order`: place actions must satisfy `px == leader order px` (lookup by `leader_oid`); taker actions must satisfy `|px/mark − 1| ≤ 1%`.
 - Funding monitor (PRD §6.2 M4, only meaningful live): cycle sums `userFunding` deltas into `equity_curve.funding_cum`; if 30-day funding > `funding_alert_pct_30d` of equity → `events` alert row (alert only, no state change).
+- **Our-fills ingestion (live):** the M1 paper broker wrote our `fills` rows itself; live fills happen on-exchange, so the cycle must also poll `userFillsByTime` for OUR address (a second `Watcher(cfg.our_address)`-style fetch) and INSERT into `fills` with the real exchange `tid` — otherwise the dashboard maker-% panel and the §14 go/no-go cost lines go dark at go-live. Marks matching `orders` rows filled.
+- **None-oid handling:** cycle treats `broker.execute(...) is None` as a rejection — no `mirror_put`, decision row `action='veto', veto_reason='exchange_reject'`; the rung retries on the next cycle's diff.
+- Manual un-HALT: `store.latest_risk_state()` (M1 Task 3) already consumes an operator-inserted `events` row with `kind='manual_reset'` — the drill in Task 3 relies on it.
 
 - [ ] **Step 1: Write failing tests**
 
