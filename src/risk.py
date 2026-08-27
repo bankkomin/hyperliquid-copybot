@@ -40,6 +40,11 @@ def check_order(
         return Verdict(approved=False, reason="B5_state")  # never ADD in WARNING
     if (now_ms - leader.fetched_at_ms) / 1000 > cfg.risk.leader_staleness_max_s:
         return Verdict(approved=False, reason="B4_stale")
+    # B3 price integrity: a mirror order must sit at HIS exact price. If it
+    # doesn't, our ladder is not his ladder and the whole premise is broken.
+    his = next((o for o in leader.open_orders if o.oid == a.leader_oid), None)
+    if his is None or a.px != his.px:
+        return Verdict(approved=False, reason="B3_price")
     if not leader.equity:
         return Verdict(approved=False, reason="B2_parity")
     scale = ours.equity / leader.equity

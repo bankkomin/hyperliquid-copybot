@@ -101,10 +101,29 @@ async def _ingest_leader_fills(deps: Deps, leader, now_ms: int) -> None:
         deps.last_fill_ts = max(deps.last_fill_ts, f["time"] + 1)
     deps.store.conn.commit()
 
+    # Snapshot our book ONCE: LiveBroker.open is an API call, so touching it per
+    # rung would be an N+1 against the exchange every cycle.
+    our_open = set(deps.broker.open)
     live_oids = {o.oid for o in leader.open_orders}
     for loid, m in mirror_before.items():
-        if loid not in live_oids and m["our_oid"] not in deps.broker.open:
+        if loid not in live_oids and m["our_oid"] not in our_open:
             deps.store.mirror_close(loid, now_ms, "his_fill")
+
+
+def _funding_monitor(deps: Deps, equity: float, now_ms: int) -> None:
+    """PRD 6.2 M4 — alert only. Long perps bleed carry; the leader paid ~0.6%/mo
+    at peak, so a sustained 2%/30d means the copy economics have changed."""
+    if deps.cfg.mode != "live" or not equity:
+        return  # paper fills pay no funding
+    paid = deps.broker.funding_since(now_ms - 30 * 86_400_000)
+    deps.store.conn.execute(
+        "UPDATE equity_curve SET funding_cum=? WHERE ts=?", (paid, now_ms)
+    )
+    deps.store.conn.commit()
+    if -paid > equity * deps.cfg.risk.funding_alert_pct_30d / 100:
+        deps.store.record_event(
+            now_ms, "warning", "funding_bleed", f"{paid:.2f} USD over 30d"
+        )
 
 
 def _enforce_halt(deps: Deps, ours: AccountState, mark_px: float, now_ms: int) -> None:
@@ -128,12 +147,18 @@ async def cycle(deps: Deps, now_ms: int) -> None:
 
     await _ingest_leader_fills(deps, leader, now_ms)
 
+    # Live only: our own fills happen on-exchange, so pull them into `fills` or
+    # the maker-%, fee and cost lines have nothing to read.
+    if deps.cfg.mode == "live":
+        deps.broker.ingest_our_fills(now_ms)
+
     ours = deps.broker.state(leader.mark_px, now_ms)
     deps.store.record_snapshot("leader", leader)
     deps.store.record_snapshot("copy", ours)
     _record_leader_orders(deps.store, leader.open_orders, now_ms)
 
     dd = deps.store.update_equity(now_ms, ours.equity)
+    _funding_monitor(deps, ours.equity, now_ms)
     state = RiskState(deps.store.latest_risk_state())
     age_s = (now_ms - leader.fetched_at_ms) / 1000
     upnl_pct = (
