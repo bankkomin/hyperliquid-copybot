@@ -3,9 +3,9 @@
 leader: "0xdae4df7207feb3b350e4284c8efe5f7dac37f637"
 mode: paper                   # paper | live — paper is ALWAYS the shipped default
 
+# The mirror is faithful by construction: his resting ladder is always mirrored,
+# and shorts are copied via signed position math. Neither is a switch.
 mirror:
-  copy_orders: true           # mirror his resting ladder (place/cancel/replace)
-  copy_shorts: true           # mirror everything, including his rare short flips
   scale_rebalance_pct: 5      # re-size ladder only when scale moves > 5%
   drift_threshold_pct: 1.0    # reconciliation trigger
 

@@ -162,6 +162,65 @@ def test_reconciliation_closes_drift(tmp_path, cfg_paper):
     assert "reconcile" in triggers
 
 
+def test_emptied_leader_ladder_clears_the_live_table(tmp_path, cfg_paper):
+    """Regression: the dashboard overlay read the newest history snapshot, so an
+    emptied ladder never disappeared from the chart."""
+    st = Store(tmp_path / "t.db")
+    w = FakeWatcher(leader_state(RUNG, position=0.0))
+    deps = make_deps(cfg_paper, st, w)
+    asyncio.run(cycle(deps, now_ms=1000))
+    assert st.conn.execute("SELECT COUNT(*) FROM leader_ladder_live").fetchone()[0] == 1
+    w._s = leader_state([], position=0.0, ts=2000)
+    asyncio.run(cycle(deps, now_ms=2000))
+    assert st.conn.execute("SELECT COUNT(*) FROM leader_ladder_live").fetchone()[0] == 0
+
+
+def test_unchanged_ladder_is_not_rewritten_to_history(tmp_path, cfg_paper):
+    st = Store(tmp_path / "t.db")
+    deps = make_deps(cfg_paper, st, FakeWatcher(leader_state(RUNG, position=0.0)))
+    for ts in (1000, 2000, 3000):
+        asyncio.run(cycle(deps, now_ms=ts))
+    n = st.conn.execute("SELECT COUNT(*) FROM leader_open_orders").fetchone()[0]
+    assert n == 1  # one history row, not one per cycle
+
+
+def test_leader_zero_equity_does_not_crash_the_cycle(tmp_path, cfg_paper):
+    """Regression: ZeroDivisionError was swallowed by run()'s handler, silently
+    freezing the mirror while our position stayed in the market."""
+    st = Store(tmp_path / "t.db")
+    deps = make_deps(cfg_paper, st, FakeWatcher(leader_state([], position=0.0, equity=0.0)))
+    asyncio.run(cycle(deps, now_ms=1000))  # must not raise
+    kinds = [r[0] for r in st.conn.execute("SELECT kind FROM events").fetchall()]
+    assert "leader_zero_equity" in kinds
+
+
+def test_rebalance_cancels_are_not_logged_as_his_cancel(tmp_path, cfg_paper):
+    st = Store(tmp_path / "t.db")
+    w = FakeWatcher(leader_state(RUNG, position=0.0))
+    deps = make_deps(cfg_paper, st, w)
+    asyncio.run(cycle(deps, now_ms=1000))
+    w._s = leader_state(  # he amended the rung's price
+        [Order(oid=1, side="B", px=61_000, sz=0.2, ts_ms=0)], position=0.0, ts=2000
+    )
+    asyncio.run(cycle(deps, now_ms=2000))
+    reasons = [
+        r[0] for r in st.conn.execute("SELECT close_reason FROM mirror_map").fetchall()
+    ]
+    assert "rebalance" in reasons  # closed row kept alongside the re-placed one
+    live = st.mirror_get()
+    assert live[1]["px"] == 61_000  # and we are now mirroring the amended price
+
+
+def test_halt_button_from_dashboard_is_honored(tmp_path, cfg_paper):
+    st = Store(tmp_path / "t.db")
+    deps = make_deps(cfg_paper, st, FakeWatcher(leader_state(RUNG)))
+    asyncio.run(cycle(deps, now_ms=1000))
+    st.record_event(1500, "critical", "halt_requested", "dashboard button")
+    asyncio.run(cycle(deps, now_ms=2000))
+    assert st.latest_risk_state() == "HALT"
+    assert deps.broker.open == {} and deps.broker.position == 0.0
+
+
 def test_divergence_and_anomaly_alerts(tmp_path, cfg_paper):
     st = Store(tmp_path / "t.db")
     w = FakeWatcher(leader_state(RUNG, position=1.0))

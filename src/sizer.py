@@ -43,20 +43,24 @@ def diff_ladders(
 
     for loid, m in mirror.items():
         stale_scale = abs(scale / m["scale_used"] - 1) * 100 > rebalance_pct
-        if loid in his and not stale_scale:
+        o = his.get(loid)
+        # An amended order keeps its oid. A price change is always an amendment;
+        # a size change is only an amendment when it GREW — shrinking means he
+        # was partially filled, which the fill path already handles.
+        amended = bool(o) and (o.px != m["px"] or o.sz > m["leader_sz"] + 1e-9)
+        if o and not stale_scale and not amended:
             continue
         actions.append(
             MirrorAction(
                 kind="cancel",
-                side=his[loid].side if loid in his else "B",
+                side=o.side if o else "B",
                 px=m["px"],
                 sz=m["our_sz"],
                 leader_oid=loid,
                 our_oid=m["our_oid"],
             )
         )
-        if stale_scale and loid in his:  # re-place at the new scale
-            o = his[loid]
+        if o:  # re-place at the new scale / new terms
             sz = mirror_size(o.sz, scale, o.px)
             if sz:
                 actions.append(

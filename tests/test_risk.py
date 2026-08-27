@@ -71,6 +71,30 @@ def test_stale_leader_goes_warning_and_recovers(cfg_paper):
     assert state == RiskState.NORMAL
 
 
+def test_stale_data_still_allows_cancels(cfg_paper):
+    """Regression: staleness is what CAUSES warning, so gating cancels on it
+    stranded the ladder exactly when pulling orders mattered most."""
+    cancel = MirrorAction(kind="cancel", side="B", px=72_000.0, sz=0.01, leader_oid=1, our_oid=5)
+    v = check_order(
+        cancel, acct(10_000, 0.18, 0), acct(66_435, 1.33557, 0),
+        1_000_000 + 999_000, RiskState.WARNING, cfg_paper,
+    )
+    assert v.approved
+
+
+def test_stop_loss_overlay_off_by_default(cfg_paper):
+    state, _ = run_monitors(-2.0, 10, RiskState.NORMAL, cfg_paper, upnl_pct=-80.0)
+    assert state == RiskState.NORMAL  # faithful mirror: leader has no stops
+
+
+def test_stop_loss_overlay_fires_when_enabled(cfg_paper):
+    cfg = cfg_paper.model_copy(
+        update={"risk": cfg_paper.risk.model_copy(update={"stop_loss_overlay": -20.0})}
+    )
+    state, alerts = run_monitors(-2.0, 10, RiskState.NORMAL, cfg, upnl_pct=-25.0)
+    assert state == RiskState.HALT and "stop_loss_overlay" in alerts[0]
+
+
 def test_halt_is_sticky(cfg_paper):
     state, _ = run_monitors(-2.0, 10, RiskState.HALT, cfg_paper)
     assert state == RiskState.HALT  # never auto-exits

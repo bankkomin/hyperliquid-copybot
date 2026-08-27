@@ -5,13 +5,14 @@ physically cannot place an order or corrupt bot state. The single exception is
 the HALT button, which inserts one `halt_requested` event row.
 """
 
+import json
 import sqlite3
 import time
 import urllib.request
 
 import dash
 import plotly.graph_objects as go
-from dash import Input, Output, State, dcc, html
+from dash import Input, Output, dcc, html
 
 from src.config import Config
 
@@ -61,11 +62,11 @@ def fetch_candles(interval: str = "1h", api_url: str = "https://api.hyperliquid.
     try:
         req = urllib.request.Request(
             f"{api_url}/info",
-            data=__import__("json").dumps(body).encode(),
+            data=json.dumps(body).encode(),
             headers={"Content-Type": "application/json"},
         )
         with urllib.request.urlopen(req, timeout=10) as r:
-            data = __import__("json").load(r)
+            data = json.load(r)
         _candle_cache.update(ts=time.time(), data=data)
         return data
     except Exception:
@@ -133,6 +134,15 @@ def _table(headers, rows):
     )
 
 
+def resolve_state(rows) -> str:
+    """Same rule as store.latest_risk_state, applied to a read-only query result:
+    a manual_reset row means an operator cleared the HALT."""
+    if not rows:
+        return "NORMAL"
+    kind, message = rows[0][0], rows[0][1]
+    return "NORMAL" if kind == "manual_reset" else message
+
+
 def _snapshot(db: ReadOnlyDB, who: str):
     rows = db.q(
         "SELECT equity, position_btc, entry_px, upnl, leverage, mark_px FROM snapshots "
@@ -145,22 +155,19 @@ def _snapshot(db: ReadOnlyDB, who: str):
 def build_view(db: ReadOnlyDB, cfg: Config):
     """All panels for one refresh. Pure-ish: DB in, Dash children out."""
     leader, ours = _snapshot(db, "leader"), _snapshot(db, "copy")
-    state_rows = db.q(
-        "SELECT kind, message, ts FROM events "
-        "WHERE kind IN ('state_change','manual_reset') ORDER BY id DESC LIMIT 1"
+    state = resolve_state(
+        db.q(
+            "SELECT kind, message FROM events "
+            "WHERE kind IN ('state_change','manual_reset') ORDER BY id DESC LIMIT 1"
+        )
     )
-    state = "NORMAL"
-    if state_rows:
-        state = "NORMAL" if state_rows[0][0] == "manual_reset" else state_rows[0][1]
 
     last_ts = db.q("SELECT MAX(ts) FROM snapshots")
     age_s = (time.time() * 1000 - (last_ts[0][0] or 0)) / 1000 if last_ts and last_ts[0][0] else 0
 
-    # Pending orders of BOTH accounts — the overlay source.
-    leader_orders = db.q(
-        "SELECT side, px, sz FROM leader_open_orders WHERE snapshot_ts="
-        "(SELECT MAX(snapshot_ts) FROM leader_open_orders) ORDER BY px DESC"
-    )
+    # Pending orders of BOTH accounts — the overlay source. leader_ladder_live is
+    # rewritten every cycle, so an emptied ladder actually disappears here.
+    leader_orders = db.q("SELECT side, px, sz FROM leader_ladder_live ORDER BY px DESC")
     our_orders = db.q("SELECT side, px, sz FROM orders WHERE status='open' ORDER BY px DESC")
     overlay = [("leader", s, p, z) for s, p, z in leader_orders]
     overlay += [("ours", s, p, z) for s, p, z in our_orders]
@@ -307,12 +314,9 @@ def make_app(cfg: Config) -> dash.Dash:
     @app.callback(
         Output("halt-ack", "children"),
         Input("halt-btn", "n_clicks"),
-        State("halt-btn", "n_clicks"),
         prevent_initial_call=True,
     )
-    def halt(n_clicks, _state):
-        if not n_clicks:
-            return ""
+    def halt(_n_clicks):
         db.request_halt(int(time.time() * 1000))
         return "HALT requested - the bot will cancel and flatten on its next cycle."
 

@@ -31,22 +31,30 @@ def check_order(
     """
     if state == RiskState.HALT:
         return Verdict(approved=False, reason="B5_state")
-    if state == RiskState.WARNING and a.kind == "place":
+    if a.kind != "place":
+        # Risk REDUCTION is never blocked. Staleness and WARNING are exactly the
+        # states where pulling orders matters most, so gating cancels here would
+        # strand the ladder in the move that caused the alarm.
+        return Verdict(approved=True)
+    if state == RiskState.WARNING:
         return Verdict(approved=False, reason="B5_state")  # never ADD in WARNING
     if (now_ms - leader.fetched_at_ms) / 1000 > cfg.risk.leader_staleness_max_s:
         return Verdict(approved=False, reason="B4_stale")
-    if a.kind == "place":
-        if not leader.equity:
-            return Verdict(approved=False, reason="B2_parity")
-        scale = ours.equity / leader.equity
-        cap = exposure(leader) * scale * cfg.risk.mirror_parity_tolerance
-        if exposure(ours) + a.sz * a.px > cap:
-            return Verdict(approved=False, reason="B2_parity")
+    if not leader.equity:
+        return Verdict(approved=False, reason="B2_parity")
+    scale = ours.equity / leader.equity
+    cap = exposure(leader) * scale * cfg.risk.mirror_parity_tolerance
+    if exposure(ours) + a.sz * a.px > cap:
+        return Verdict(approved=False, reason="B2_parity")
     return Verdict(approved=True)
 
 
 def run_monitors(
-    drawdown_pct: float, leader_age_s: float, state: RiskState, cfg: Config
+    drawdown_pct: float,
+    leader_age_s: float,
+    state: RiskState,
+    cfg: Config,
+    upnl_pct: float = 0.0,
 ) -> tuple[RiskState, list[str]]:
     """Standing monitors. HALT is sticky — it never auto-exits (an operator
     inserts a manual_reset event; see store.latest_risk_state)."""
@@ -55,6 +63,11 @@ def run_monitors(
         return RiskState.HALT, alerts
     if drawdown_pct <= cfg.risk.max_drawdown_pct:
         alerts.append(f"kill_switch drawdown {drawdown_pct:.1f}%")
+        return RiskState.HALT, alerts
+    # M6, OFF by default: the leader trades without stops and that is what we
+    # copy. Set risk.stop_loss_overlay to opt into training wheels.
+    if cfg.risk.stop_loss_overlay is not None and upnl_pct <= cfg.risk.stop_loss_overlay:
+        alerts.append(f"stop_loss_overlay upnl {upnl_pct:.1f}%")
         return RiskState.HALT, alerts
     if leader_age_s > cfg.risk.leader_staleness_max_s:
         if state != RiskState.WARNING:

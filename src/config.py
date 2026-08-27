@@ -7,8 +7,8 @@ from pydantic import BaseModel
 
 
 class Mirror(BaseModel):
-    copy_orders: bool = True
-    copy_shorts: bool = True
+    # Order-mirroring and short-copying are unconditional — the whole product is
+    # a faithful mirror, so they were never real switches.
     scale_rebalance_pct: float = 5
     drift_threshold_pct: float = 1.0
 

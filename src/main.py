@@ -6,15 +6,17 @@ import os
 import sys
 import threading
 import time
-import webbrowser
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import structlog
 
+from src import logging_setup
 from src.config import Config, load_config
 from src.models import AccountState, RiskState
 from src.paper import PaperBroker
+from src.report import write_daily
 from src.risk import check_order, run_monitors
 from src.sizer import compute_scale, diff_ladders, position_delta
 from src.store import Store
@@ -37,12 +39,10 @@ class Deps:
 
 
 def _record_leader_orders(store: Store, orders, now_ms: int) -> None:
-    for o in orders:
-        store.conn.execute(
-            "INSERT OR REPLACE INTO leader_open_orders VALUES (?,?,?,?,?)",
-            (now_ms, o.oid, o.side, o.px, o.sz),
-        )
-    store.conn.commit()
+    """Live ladder rewritten every cycle (so an emptied ladder clears), history
+    appended only when it changes (so we don't write 1,440 identical snapshots/day)."""
+    if store.set_live_ladder(orders, now_ms):
+        log.info("leader_ladder_changed", rungs=len(orders))
 
 
 async def _fetch_leader(deps: Deps, now_ms: int):
@@ -136,7 +136,12 @@ async def cycle(deps: Deps, now_ms: int) -> None:
     dd = deps.store.update_equity(now_ms, ours.equity)
     state = RiskState(deps.store.latest_risk_state())
     age_s = (now_ms - leader.fetched_at_ms) / 1000
-    new_state, alerts = run_monitors(dd, age_s, state, deps.cfg)
+    upnl_pct = (
+        (ours.mark_px - ours.entry_px) * ours.position / ours.equity * 100
+        if ours.entry_px and ours.equity
+        else 0.0
+    )
+    new_state, alerts = run_monitors(dd, age_s, state, deps.cfg, upnl_pct)
     if state != RiskState.HALT and deps.store.halt_requested():
         new_state, alerts = RiskState.HALT, ["halt_requested from dashboard"]
     if new_state != state:
@@ -154,6 +159,11 @@ async def cycle(deps: Deps, now_ms: int) -> None:
     if state == RiskState.HALT:
         return
 
+    if leader.equity <= 0:  # liquidated / withdrawn: no ratio to mirror by
+        deps.store.record_event(now_ms, "critical", "leader_zero_equity", "cannot compute scale")
+        deps.store.record_decision(now_ms, "poll", "veto", state.value,
+                                   veto_reason="leader_zero_equity")
+        return
     scale = compute_scale(ours.equity, leader.equity)
 
     # Alert-only monitors (PRD 6.2 M3 anomaly, M5 divergence) — never a brake.
@@ -170,7 +180,13 @@ async def cycle(deps: Deps, now_ms: int) -> None:
     actions = diff_ladders(
         leader.open_orders, deps.store.mirror_get(), scale, deps.cfg.mirror.scale_rebalance_pct
     )
-    for a in actions:
+    # Cancels first, then re-read our state: otherwise a scale re-balance measures
+    # B2 parity against exposure the cancels already removed and vetoes every
+    # replacement, leaving the ladder empty exactly during a fast move.
+    actions.sort(key=lambda a: a.kind != "cancel")
+    for i, a in enumerate(actions):
+        if a.kind == "place" and i and actions[i - 1].kind == "cancel":
+            ours = deps.broker.state(leader.mark_px, now_ms)
         v = check_order(a, ours, leader, now_ms, state, deps.cfg)
         deps.store.record_decision(
             now_ms,
@@ -186,7 +202,12 @@ async def cycle(deps: Deps, now_ms: int) -> None:
             continue
         our_oid = deps.broker.execute(a, now_ms)
         if a.kind != "place":
-            deps.store.mirror_close(a.leader_oid, now_ms, "his_cancel")
+            # He still has the order -> we are re-mirroring it (scale/amendment),
+            # not following a cancel of his. PRD 10.1 reserves 'rebalance' for this.
+            still_his = any(o.oid == a.leader_oid for o in leader.open_orders)
+            deps.store.mirror_close(
+                a.leader_oid, now_ms, "rebalance" if still_his else "his_cancel"
+            )
         elif our_oid is None:  # exchange rejected (live mode) — retry next cycle
             deps.store.record_decision(
                 now_ms, "poll", "veto", state.value, veto_reason="exchange_reject"
@@ -244,28 +265,32 @@ async def run(cfg: Config) -> None:
     )
     startup(deps)
     while True:
+        now_ms = int(time.time() * 1000)
         try:
-            await cycle(deps, int(time.time() * 1000))
-            _maybe_daily_report(deps)
+            await cycle(deps, now_ms)
+            _maybe_daily_report(deps, now_ms)
         except Exception:
             log.exception("cycle_failed")
         await asyncio.sleep(cfg.storage.snapshot_interval_s)
 
 
-def _maybe_daily_report(deps: Deps) -> None:
-    from datetime import datetime, timezone
-
-    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if deps._last_report_day in ("", day):
-        deps._last_report_day = day
+def _maybe_daily_report(deps: Deps, now_ms: int) -> None:
+    """Once per UTC day, write yesterday's report. The last written day lives in
+    the DB, so a restart cannot silently skip a day."""
+    now = datetime.fromtimestamp(now_ms / 1000, timezone.utc)
+    today = now.strftime("%Y-%m-%d")
+    if deps.store.last_report_day() == today:
         return
-    from src.report import write_daily
-
-    write_daily(deps.store, deps._last_report_day, deps.cfg)
-    deps._last_report_day = day
+    deps.store.record_event(now_ms, "info", "daily_report", today)
+    day_start_ms = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+    if deps.store.conn.execute(
+        "SELECT 1 FROM equity_curve WHERE ts < ? LIMIT 1", (day_start_ms,)
+    ).fetchone():
+        write_daily(deps.store, (now - timedelta(days=1)).strftime("%Y-%m-%d"), deps.cfg)
 
 
 def main() -> None:
+    logging_setup.configure()  # MUST come first: pythonw has no stdout to log to
     cfg = load_config("config.yaml")
     PID_FILE.parent.mkdir(exist_ok=True)
     PID_FILE.write_text(str(os.getpid()))

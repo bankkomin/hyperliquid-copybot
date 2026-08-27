@@ -24,11 +24,16 @@ if not exist logs mkdir logs
 if not exist data mkdir data
 if not exist reports mkdir reports
 
-rem ---------- launch ----------
-if exist logs\copybot.pid (
-  echo Copybot already running ^(logs\copybot.pid exists^). Use stop_copybot.bat first.
+rem ---------- stale-pid guard ----------
+rem A crash or reboot leaves the pid file behind. Only refuse to start when that
+rem PID is genuinely still alive, or the VPS would never auto-restart itself.
+if exist logs\copybot.pid call :check_stale
+if "%STILL_RUNNING%"=="1" (
+  echo Copybot is already running. Use stop_copybot.bat first.
   pause & exit /b 1
 )
+
+rem ---------- launch ----------
 echo Starting copybot in the background...
 start "" venv\Scripts\pythonw.exe -m src.main
 timeout /t 5 >nul
@@ -37,3 +42,15 @@ if not exist logs\copybot.pid (
 )
 start http://localhost:8061
 exit /b 0
+
+:check_stale
+set STILL_RUNNING=
+set /p OLDPID=<logs\copybot.pid
+tasklist /fi "PID eq %OLDPID%" 2>nul | find "%OLDPID%" >nul
+if not errorlevel 1 (
+  set STILL_RUNNING=1
+  goto :eof
+)
+echo [setup] Removing stale pid file from PID %OLDPID% ^(process is gone^).
+del logs\copybot.pid
+goto :eof

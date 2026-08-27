@@ -63,14 +63,39 @@ def render_daily(store: Store, day: str, cfg: Config | None = None) -> tuple[str
     veto_txt = ", ".join(f"{r or 'n/a'} x{c}" for r, c in vetoes) or "none"
     mode = (cfg.mode if cfg else "paper").upper()
 
+    # Copy-quality metrics — PRD 11.3/14 make these the M1->M2 go/no-go numbers.
+    leader_eq = q(
+        "SELECT equity FROM snapshots WHERE who='leader' AND ts<? ORDER BY ts DESC LIMIT 1",
+        (hi,)
+    ).fetchone() or (0.0,)
+    scale = ours[0] / leader_eq[0] if leader_eq[0] else 0.0
+    target = leader[0] * scale
+    drift_pct = (ours[1] / target - 1) * 100 if target else 0.0
+    week = q(
+        "SELECT COUNT(*), COALESCE(SUM(crossed),0) FROM fills WHERE ts>=?",
+        (hi - 7 * 86_400_000,)
+    ).fetchone()
+    maker_7d = 100.0 * (week[0] - week[1]) / week[0] if week[0] else 0.0
+    lag = q(
+        "SELECT AVG(f.ts - lf.ts)/1000.0 FROM fills f JOIN leader_fills lf "
+        "ON ABS(f.px - lf.px) < 0.5 WHERE f.ts>=? AND f.ts<?", (lo, hi)
+    ).fetchone()
+    lag_s = lag[0] if lag and lag[0] is not None else 0.0
+    funding = q(
+        "SELECT COALESCE(MAX(funding_cum),0) FROM equity_curve WHERE ts<?", (hi,)
+    ).fetchone()[0]
+
     tg = (
         f"Copybot daily - {day} ({mode})\n"
         f"State: {state}\n"
         f"Equity: ${ours[0]:,.0f} ({day_pct:+.2f}% day, HWM {curve[2]:.1f}%)\n"
         f"Position: {ours[1]:.5f} BTC"
         + (f" @ ${ours[2]:,.0f}" if ours[2] else "")
-        + f" | leader {leader[0]:.5f} BTC\n"
-        f"Today: {orders} orders, {n_fills} fills (maker {maker_pct:.0f}%), fees ${fees:,.2f}\n"
+        + f" | leader {leader[0]:.5f} BTC (drift {drift_pct:+.1f}%)\n"
+        f"Today: {orders} orders, {n_fills} fills (maker {maker_pct:.0f}%)\n"
+        f"Costs: fees ${fees:,.2f} - funding ${funding:,.2f}\n"
+        f"Copy quality 7d: maker {maker_7d:.0f}% - avg fill lag {lag_s:.0f}s "
+        f"- tracking error {abs(drift_pct):.1f}%\n"
         f"Vetoes: {veto_txt}"
     )
 
@@ -82,8 +107,11 @@ def render_daily(store: Store, day: str, cfg: Config | None = None) -> tuple[str
             ("Drawdown vs HWM", f"{curve[2]:.2f}%"),
             ("Our position", f"{ours[1]:.5f} BTC"),
             ("Leader position", f"{leader[0]:.5f} BTC"),
+            ("Drift vs leader", f"{drift_pct:+.2f}%"),
             ("Orders", orders), ("Fills", n_fills),
-            ("Maker %", f"{maker_pct:.0f}%"), ("Fees", f"${fees:,.2f}"),
+            ("Maker % (day)", f"{maker_pct:.0f}%"), ("Maker % (7d)", f"{maker_7d:.0f}%"),
+            ("Avg fill lag", f"{lag_s:.0f}s"),
+            ("Fees", f"${fees:,.2f}"), ("Funding", f"${funding:,.2f}"),
             ("Vetoes", veto_txt),
         ]
     )
