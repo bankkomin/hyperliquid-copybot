@@ -36,6 +36,10 @@ class MirrorAction(BaseModel):
     sz: float
     leader_oid: int
     our_oid: int | None = None
+    # His TRUE size. Never reconstruct it as sz/scale — our sz is floor-rounded,
+    # so the round-trip lands below his real size and makes every rung look
+    # amended on the next cycle.
+    leader_sz: float = 0.0
 
 
 class Verdict(BaseModel):

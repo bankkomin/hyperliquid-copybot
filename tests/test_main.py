@@ -221,6 +221,72 @@ def test_halt_button_from_dashboard_is_honored(tmp_path, cfg_paper):
     assert deps.broker.open == {} and deps.broker.position == 0.0
 
 
+def test_ladder_is_stable_across_cycles(tmp_path, cfg_paper):
+    """Regression (severe): mirror_map stored a RECONSTRUCTED leader_sz (our
+    floor-rounded sz / scale), which always landed below his true size, so every
+    rung looked 'amended' and the whole ladder cancel/replaced every 60 seconds
+    — destroying maker queue position and burning the action allowance."""
+    st = Store(tmp_path / "t.db")
+    rungs = [
+        Order(oid=1, side="B", px=57_860, sz=0.20, ts_ms=0),
+        Order(oid=2, side="B", px=62_944, sz=0.12, ts_ms=0),
+        Order(oid=3, side="B", px=73_521, sz=0.05, ts_ms=0),
+    ]
+    deps = make_deps(cfg_paper, st, FakeWatcher(leader_state(rungs, position=0.0)))
+    asyncio.run(cycle(deps, now_ms=1000))
+    placed = st.conn.execute("SELECT COUNT(*) FROM mirror_map").fetchone()[0]
+    for ts in (2000, 3000, 4000):
+        asyncio.run(cycle(deps, now_ms=ts))
+    assert st.conn.execute("SELECT COUNT(*) FROM mirror_map").fetchone()[0] == placed
+    assert len(st.mirror_get()) == 3  # same three rungs, never churned
+
+
+def test_halt_retries_until_flat(tmp_path, cfg_paper):
+    """Regression: the flatten fired once, during the crash that caused HALT —
+    exactly when an IOC misses — and was never retried."""
+    st = Store(tmp_path / "t.db")
+    deps = make_deps(cfg_paper, st, FakeWatcher(leader_state(RUNG)))
+    asyncio.run(cycle(deps, now_ms=1000))
+    deps.broker.cash -= 6_000
+    deps.broker._save()
+    asyncio.run(cycle(deps, now_ms=2000))
+    assert st.latest_risk_state() == "HALT"
+
+    # Something leaves us exposed again while HALT persists.
+    deps.broker.market_fill("B", 0.05, 79_660, 2500)
+    assert deps.broker.position != 0.0
+    asyncio.run(cycle(deps, now_ms=3000))
+    assert deps.broker.position == 0.0  # re-flattened, not abandoned
+
+
+def test_reconcile_skips_sub_minimum_dust(tmp_path, cfg_paper):
+    """Regression: when the leader goes flat, our dust produced a sub-$10 IOC
+    that the exchange rejects every cycle forever, each logged as a success."""
+    st = Store(tmp_path / "t.db")
+    deps = make_deps(cfg_paper, st, FakeWatcher(leader_state([], position=0.0)))
+    deps.broker.market_fill("B", 0.00005, 79_660, 500)  # ~$4 of dust
+    asyncio.run(cycle(deps, now_ms=1000))
+    triggers = [r[0] for r in st.conn.execute("SELECT trigger FROM decisions").fetchall()]
+    assert "reconcile" not in triggers
+
+
+def test_failed_cancel_keeps_the_mirror_row(tmp_path, cfg_paper):
+    """Regression: closing the row on a rejected cancel orphaned a live order —
+    diff_ladders can only cancel rungs it still has a row for."""
+    st = Store(tmp_path / "t.db")
+    w = FakeWatcher(leader_state(RUNG, position=0.0))
+    deps = make_deps(cfg_paper, st, w)
+    asyncio.run(cycle(deps, now_ms=1000))
+
+    real_execute = deps.broker.execute
+    deps.broker.execute = lambda a, ts: None if a.kind == "cancel" else real_execute(a, ts)
+    w._s = leader_state([], position=0.0, ts=2000)  # he cancels the rung
+    asyncio.run(cycle(deps, now_ms=2000))
+    assert 1 in st.mirror_get()  # row survives so we retry the cancel
+    kinds = [r[0] for r in st.conn.execute("SELECT kind FROM events").fetchall()]
+    assert "cancel_failed" in kinds
+
+
 def test_divergence_and_anomaly_alerts(tmp_path, cfg_paper):
     st = Store(tmp_path / "t.db")
     w = FakeWatcher(leader_state(RUNG, position=1.0))

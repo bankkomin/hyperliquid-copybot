@@ -71,9 +71,18 @@ def test_order_exception_returns_none(tmp_path):
     ) is None
 
 
+OK_CANCEL = {"status": "ok", "response": {"data": {"statuses": ["success"]}}}
+ERR_CANCEL = {"status": "ok", "response": {"data": {"statuses": [{"error": "never placed"}]}}}
+
+
+def _resting(*oids):
+    return [{"coin": "BTC", "oid": o, "side": "B", "limitPx": "1", "sz": "1"} for o in oids]
+
+
 def test_cancel_all_cancels_every_open_order(tmp_path):
     b, ex = broker(tmp_path)
-    b.info.open_orders.return_value = [{"coin": "BTC", "oid": 1}, {"coin": "BTC", "oid": 2}]
+    b.info.frontend_open_orders.return_value = _resting(1, 2)
+    ex.cancel.return_value = OK_CANCEL
     assert b.cancel_all() == 2
     assert ex.cancel.call_count == 2
 
@@ -81,17 +90,67 @@ def test_cancel_all_cancels_every_open_order(tmp_path):
 def test_cancel_all_survives_one_failing_cancel(tmp_path):
     """Safety-critical: one 429 must not leave the rest of the ladder resting."""
     b, ex = broker(tmp_path)
-    b.info.open_orders.return_value = [{"coin": "BTC", "oid": n} for n in (1, 2, 3)]
-    ex.cancel.side_effect = [None, ConnectionError("429"), None]
+    b.info.frontend_open_orders.return_value = _resting(1, 2, 3)
+    ex.cancel.side_effect = [OK_CANCEL, ConnectionError("429"), OK_CANCEL]
     assert b.cancel_all() == 2  # CONFIRMED cancels, not attempts
     assert ex.cancel.call_count == 3  # kept going past the failure
 
 
+def test_cancel_all_does_not_count_rejected_cancels(tmp_path):
+    """The SDK only raises on HTTP>=400; a rejected cancel returns 200 with an
+    error payload. Counting it would leave live orders while HALT reports clean."""
+    b, ex = broker(tmp_path)
+    b.info.frontend_open_orders.return_value = _resting(1, 2)
+    ex.cancel.side_effect = [OK_CANCEL, ERR_CANCEL]
+    assert b.cancel_all() == 1
+
+
 def test_cancel_all_ignores_other_coins(tmp_path):
     b, ex = broker(tmp_path)
-    b.info.open_orders.return_value = [{"coin": "ETH", "oid": 9}, {"coin": "BTC", "oid": 1}]
+    b.info.frontend_open_orders.return_value = [
+        {"coin": "ETH", "oid": 9, "side": "B", "limitPx": "1", "sz": "1"}
+    ] + _resting(1)
+    ex.cancel.return_value = OK_CANCEL
     assert b.cancel_all() == 1
     ex.cancel.assert_called_once_with("BTC", 1)
+
+
+def test_failed_cancel_returns_none_so_mirror_row_survives(tmp_path):
+    b, ex = broker(tmp_path)
+    b.info.frontend_open_orders.return_value = []
+    ex.cancel.return_value = ERR_CANCEL
+    out = b.execute(
+        MirrorAction(kind="cancel", side="B", px=1.0, sz=1.0, leader_oid=1, our_oid=5), now_ms=1
+    )
+    assert out is None  # caller must not close the mirror row
+
+
+def test_duplicate_place_adopts_the_resting_twin(tmp_path):
+    """A transport timeout on an accepted order must not double our size."""
+    b, ex = broker(tmp_path)
+    b.info.frontend_open_orders.return_value = [
+        {"coin": "BTC", "oid": 777, "side": "B", "limitPx": "57860.0", "sz": "0.0301"}
+    ]
+    oid = b.execute(
+        MirrorAction(kind="place", side="B", px=57_860.0, sz=0.0301, leader_oid=1), now_ms=1
+    )
+    assert oid == 777
+    ex.order.assert_not_called()
+
+
+def test_flatten_is_reduce_only(tmp_path):
+    b, ex = broker(tmp_path)
+    ex.order.return_value = {
+        "status": "ok", "response": {"data": {"statuses": [{"filled": {"oid": 9}}]}}
+    }
+    assert b.market_fill("A", 0.1, 80_000.0, now_ms=1, reduce_only=True) is True
+    assert ex.order.call_args.kwargs["reduce_only"] is True
+
+
+def test_flatten_reports_failure(tmp_path):
+    b, ex = broker(tmp_path)
+    ex.order.return_value = {"status": "err", "response": "no liquidity"}
+    assert b.market_fill("A", 0.1, 80_000.0, now_ms=1, reduce_only=True) is False
 
 
 def test_ingest_our_fills_persists_exchange_tids(tmp_path):

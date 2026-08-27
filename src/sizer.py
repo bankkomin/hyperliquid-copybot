@@ -64,7 +64,10 @@ def diff_ladders(
             sz = mirror_size(o.sz, scale, o.px)
             if sz:
                 actions.append(
-                    MirrorAction(kind="place", side=o.side, px=o.px, sz=sz, leader_oid=loid)
+                    MirrorAction(
+                        kind="place", side=o.side, px=o.px, sz=sz,
+                        leader_oid=loid, leader_sz=o.sz,
+                    )
                 )
 
     for oid, o in his.items():
@@ -72,7 +75,10 @@ def diff_ladders(
             sz = mirror_size(o.sz, scale, o.px)
             if sz:
                 actions.append(
-                    MirrorAction(kind="place", side=o.side, px=o.px, sz=sz, leader_oid=oid)
+                    MirrorAction(
+                        kind="place", side=o.side, px=o.px, sz=sz,
+                        leader_oid=oid, leader_sz=o.sz,
+                    )
                 )
     return actions
 

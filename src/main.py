@@ -17,8 +17,8 @@ from src.config import Config, load_config
 from src.models import AccountState, RiskState
 from src.paper import PaperBroker
 from src.report import write_daily
-from src.risk import check_order, run_monitors
-from src.sizer import compute_scale, diff_ladders, position_delta
+from src.risk import check_order, exposure, run_monitors
+from src.sizer import MIN_NOTIONAL_USD, compute_scale, diff_ladders, position_delta
 from src.store import Store
 from src.watcher import Watcher
 
@@ -126,17 +126,35 @@ def _funding_monitor(deps: Deps, equity: float, now_ms: int) -> None:
         )
 
 
-def _enforce_halt(deps: Deps, ours: AccountState, mark_px: float, now_ms: int) -> None:
-    """HALT must ACT, not just record: cancel everything, flatten, stop copying."""
-    deps.broker.cancel_all()
+def _enforce_halt(deps: Deps, ours: AccountState, mark_px: float, now_ms: int) -> bool:
+    """HALT must ACT, not just record: cancel everything, flatten, stop copying.
+
+    Returns True only when the account is verifiably clean. The caller re-runs
+    this every cycle while HALT persists, because the one thing we cannot do is
+    give up after a single attempt: the IOC fires during the very crash that
+    triggered HALT, which is exactly when it misses the book.
+    """
+    canceled = deps.broker.cancel_all()
     for loid in deps.store.mirror_get():
         deps.store.mirror_close(loid, now_ms, "halt")
+    filled = True
     if ours.position:
-        deps.broker.market_fill(
-            "A" if ours.position > 0 else "B", abs(ours.position), mark_px, now_ms
+        filled = deps.broker.market_fill(
+            "A" if ours.position > 0 else "B", abs(ours.position), mark_px, now_ms,
+            reduce_only=True,  # can never flip us into fresh naked exposure
         )
-    deps.store.record_decision(now_ms, "monitor_M1", "halt", RiskState.HALT.value)
-    log.critical("halt_enforced", position=ours.position)
+    still_open = len(deps.broker.open)
+    clean = filled and not still_open
+    log.critical(
+        "halt_enforced", position=ours.position, canceled=canceled,
+        flatten_accepted=filled, orders_left=still_open,
+    )
+    if not clean:
+        deps.store.record_event(
+            now_ms, "critical", "halt_incomplete",
+            f"orders_left={still_open} flatten_accepted={filled} — retrying next cycle",
+        )
+    return clean
 
 
 async def cycle(deps: Deps, now_ms: int) -> None:
@@ -182,6 +200,10 @@ async def cycle(deps: Deps, now_ms: int) -> None:
             _enforce_halt(deps, ours, leader.mark_px, now_ms)
     state = new_state
     if state == RiskState.HALT:
+        # Keep enforcing while anything is still exposed. A single attempt is
+        # not enough: the flatten IOC fires during the crash that caused HALT.
+        if ours.position or deps.broker.open:
+            _enforce_halt(deps, ours, leader.mark_px, now_ms)
         return
 
     if leader.equity <= 0:  # liquidated / withdrawn: no ratio to mirror by
@@ -227,6 +249,15 @@ async def cycle(deps: Deps, now_ms: int) -> None:
             continue
         our_oid = deps.broker.execute(a, now_ms)
         if a.kind != "place":
+            if our_oid is None:
+                # The cancel was REJECTED. Closing the mirror row here would
+                # orphan an order that is still live: diff_ladders can only
+                # cancel rungs it still has a row for, so it would rest forever.
+                deps.store.record_event(
+                    now_ms, "warning", "cancel_failed",
+                    f"leader_oid={a.leader_oid} our_oid={a.our_oid} — retry next cycle",
+                )
+                continue
             # He still has the order -> we are re-mirroring it (scale/amendment),
             # not following a cancel of his. PRD 10.1 reserves 'rebalance' for this.
             still_his = any(o.oid == a.leader_oid for o in leader.open_orders)
@@ -239,7 +270,7 @@ async def cycle(deps: Deps, now_ms: int) -> None:
             )
         else:
             deps.store.mirror_put(
-                a.leader_oid, our_oid, a.px, a.sz / scale if scale else 0.0, a.sz, scale, now_ms
+                a.leader_oid, our_oid, a.px, a.leader_sz, a.sz, scale, now_ms
             )
 
     # Reconciliation catches his taker trades and skipped rungs.
@@ -247,14 +278,29 @@ async def cycle(deps: Deps, now_ms: int) -> None:
     delta = position_delta(
         leader.position, scale, ours.position, deps.cfg.mirror.drift_threshold_pct
     )
+    # Dust guard: below the exchange minimum the IOC is rejected every cycle
+    # forever. This bites when the leader goes flat and only our dust remains.
+    if delta and abs(delta) * leader.mark_px < MIN_NOTIONAL_USD:
+        delta = 0.0
     if delta and state == RiskState.NORMAL:
-        deps.broker.market_fill(
-            "B" if delta > 0 else "A", abs(delta), leader.mark_px, now_ms
+        over_parity = (
+            exposure(ours) + abs(delta) * leader.mark_px
+            > exposure(leader) * scale * deps.cfg.risk.mirror_parity_tolerance
         )
-        deps.store.record_decision(
-            now_ms, "reconcile", "order", state.value,
-            leader_pos=leader.position, scale=scale, target=target, delta=delta,
-        )
+        if over_parity and abs(ours.position) < abs(target):
+            deps.store.record_decision(
+                now_ms, "reconcile", "veto", state.value, veto_reason="B2_parity",
+                leader_pos=leader.position, scale=scale, target=target, delta=delta,
+            )
+        else:
+            ok = deps.broker.market_fill(
+                "B" if delta > 0 else "A", abs(delta), leader.mark_px, now_ms
+            )
+            deps.store.record_decision(
+                now_ms, "reconcile", "order" if ok else "veto", state.value,
+                veto_reason="" if ok else "exchange_reject",
+                leader_pos=leader.position, scale=scale, target=target, delta=delta,
+            )
     elif not actions:
         deps.store.record_decision(
             now_ms, "poll", "skip_dust", state.value, leader_pos=leader.position, scale=scale

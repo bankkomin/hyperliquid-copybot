@@ -127,9 +127,20 @@ class PaperBroker:
             del self.open[o.oid]
             self._set_order(o, "filled")
 
-    def market_fill(self, side: str, sz: float, px: float, now_ms: int) -> None:
-        """Reconciliation / flatten fill — crosses the spread, taker fee."""
+    def market_fill(
+        self, side: str, sz: float, px: float, now_ms: int, reduce_only: bool = False
+    ) -> bool:
+        """Reconciliation / flatten fill — crosses the spread, taker fee.
+
+        reduce_only mirrors the live exchange flag: it can only shrink the
+        position, never flip it into fresh exposure.
+        """
+        if reduce_only:
+            sz = min(sz, abs(self.position))
+            if sz <= 0:
+                return True
         self._book_fill(side, sz, px, TAKER_FEE, 0, now_ms, crossed=1)
+        return True
 
     def cancel_all(self) -> int:
         n = len(self.open)

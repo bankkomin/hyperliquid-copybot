@@ -43,13 +43,47 @@ class LiveBroker:
             return None
         return (s.get("resting") or s.get("filled") or {}).get("oid")
 
+    def _cancel_ok(self, oid: int) -> bool:
+        """The SDK only raises on HTTP >= 400; a REJECTED cancel comes back 200
+        with an error payload. Counting that as success would leave live orders
+        resting while the caller believes the book is clean."""
+        try:
+            resp = self.ex.cancel("BTC", oid)
+        except Exception:
+            log.exception("cancel_failed", oid=oid)
+            return False
+        if not isinstance(resp, dict) or resp.get("status") != "ok":
+            log.warning("cancel_rejected", oid=oid, detail=str(resp)[:200])
+            return False
+        try:
+            s = resp["response"]["data"]["statuses"][0]
+        except (KeyError, IndexError, TypeError):
+            return True  # accepted, shape just differs
+        if isinstance(s, dict) and "error" in s:
+            log.warning("cancel_rejected", oid=oid, detail=str(s)[:200])
+            return False
+        return True
+
     def execute(self, a: MirrorAction, now_ms: int) -> int | None:
         if a.kind == "cancel":
-            try:
-                self.ex.cancel("BTC", a.our_oid)
-            except Exception:
-                log.exception("cancel_failed", oid=a.our_oid)
+            if not self._cancel_ok(a.our_oid):
+                return None  # caller must NOT close the mirror row
+            self.store.conn.execute(
+                "UPDATE orders SET status='canceled' WHERE oid=?", (a.our_oid,)
+            )
+            self.store.conn.commit()
             return a.our_oid
+
+        # A transport timeout on an accepted order would otherwise be retried
+        # next cycle and double our size at that rung. Adopt the resting twin.
+        for oid, o in self.open.items():
+            if (
+                o.get("side") == a.side
+                and abs(float(o.get("limitPx", 0)) - a.px) < 1e-9
+                and abs(float(o.get("sz", 0)) - a.sz) < 1e-9
+            ):
+                log.info("adopted_existing_order", oid=oid, px=a.px)
+                return oid
         try:
             resp = self.ex.order(
                 name="BTC", is_buy=a.side == "B", sz=a.sz, limit_px=a.px,
@@ -68,19 +102,25 @@ class LiveBroker:
             self.store.conn.commit()
         return oid
 
-    def market_fill(self, side: str, sz: float, px: float, now_ms: int) -> int | None:
-        """Reconciliation / flatten: IOC with a hard slippage cap off the mark."""
-        cap_pct = self._slippage_cap_pct
-        limit = px * (1 + cap_pct / 100 * (1 if side == "B" else -1))
+    def market_fill(
+        self, side: str, sz: float, px: float, now_ms: int, reduce_only: bool = False
+    ) -> bool:
+        """Reconciliation / flatten: IOC with a hard slippage cap off the mark.
+
+        Returns whether the exchange accepted it. A flatten passes
+        reduce_only=True so a position that moved between our snapshot and this
+        order can never be flipped into fresh naked exposure.
+        """
+        limit = px * (1 + self._slippage_cap_pct / 100 * (1 if side == "B" else -1))
         try:
             resp = self.ex.order(
                 name="BTC", is_buy=side == "B", sz=sz, limit_px=round(limit, PX_DECIMALS),
-                order_type={"limit": {"tif": "Ioc"}}, reduce_only=False,
+                order_type={"limit": {"tif": "Ioc"}}, reduce_only=reduce_only,
             )
         except Exception:
             log.exception("taker_failed", sz=sz, px=px)
-            return None
-        return self._oid(resp)
+            return False
+        return self._oid(resp) is not None
 
     def on_leader_fill(self, leader_oid: int, fill_sz: float, px: float, now_ms: int) -> None:
         """No-op live: the exchange fills our resting order on its own. Fill
@@ -91,20 +131,10 @@ class LiveBroker:
         """Safety-critical (kill-switch, startup recovery): isolate per-order
         errors and return CONFIRMED cancels, so a single 429 cannot leave the
         rest of the ladder resting while the caller believes cleanup ran."""
-        try:
-            oo = [o for o in self.info.open_orders(self.address) if o.get("coin") == "BTC"]
-        except Exception:
-            log.exception("open_orders_failed")
-            return 0
-        ok = 0
-        for o in oo:
-            try:
-                self.ex.cancel("BTC", o["oid"])
-                ok += 1
-            except Exception:
-                log.exception("cancel_failed", oid=o["oid"])
-        if ok < len(oo):
-            log.warning("cancel_all_incomplete", canceled=ok, total=len(oo))
+        oids = list(self.open)
+        ok = sum(1 for oid in oids if self._cancel_ok(oid))
+        if ok < len(oids):
+            log.warning("cancel_all_incomplete", canceled=ok, total=len(oids))
         return ok
 
     # ---- state ----------------------------------------------------------
@@ -123,18 +153,23 @@ class LiveBroker:
 
     def state(self, mark_px: float, now_ms: int) -> AccountState:
         ch = self.info.user_state(self.address)
-        oo = [o for o in self.info.frontend_open_orders(self.address) if o.get("coin") == "BTC"]
-        return parse_clearinghouse(ch, oo, mark_px, now_ms)
+        return parse_clearinghouse(ch, list(self.open.values()), mark_px, now_ms)
 
     def ingest_our_fills(self, now_ms: int) -> int:
         """Persist OUR exchange fills — the paper broker wrote these itself, so
-        without this the maker-%, fee and cost lines go dark at go-live."""
+        without this the maker-%, fee and cost lines go dark at go-live.
+
+        The cursor lives in the DB: an in-memory one resets to 0 on restart and
+        re-walks the account's whole fill history, blanking the recent fills the
+        report needs exactly when a crash makes them most interesting.
+        """
+        since = self.store.fill_cursor()
         try:
-            fills = self.info.user_fills_by_time(self.address, self._last_fill_ts or 0)
+            fills = self.info.user_fills_by_time(self.address, since)
         except Exception:
             log.exception("our_fills_fetch_failed")
             return 0
-        n = 0
+        n, newest = 0, since
         for f in fills:
             if f.get("coin") != "BTC":
                 continue
@@ -145,9 +180,17 @@ class LiveBroker:
                  float(f["sz"]), int(bool(f.get("crossed"))), float(f.get("closedPnl", 0)),
                  float(f.get("fee", 0))),
             )
-            self._last_fill_ts = max(self._last_fill_ts, f["time"] + 1)
+            # A resting order that filled is no longer part of our ladder.
+            self.store.conn.execute(
+                "UPDATE orders SET status='filled', filled_sz=COALESCE(filled_sz,0)+?, "
+                "avg_px=? WHERE oid=?",
+                (float(f["sz"]), float(f["px"]), f.get("oid", 0)),
+            )
+            newest = max(newest, f["time"] + 1)
             n += 1
         self.store.conn.commit()
+        if newest > since:
+            self.store.set_fill_cursor(newest)
         return n
 
     def funding_since(self, since_ms: int) -> float:

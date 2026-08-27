@@ -179,6 +179,18 @@ class Store:
         self.conn.commit()
         return new != cur
 
+    def fill_cursor(self) -> int:
+        """Where our own fill ingestion left off. Persisted so a restart does not
+        re-walk the account's entire fill history."""
+        row = self.conn.execute(
+            "SELECT message FROM events WHERE kind='fill_cursor' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def set_fill_cursor(self, ts_ms: int) -> None:
+        self.conn.execute("DELETE FROM events WHERE kind='fill_cursor'")
+        self.record_event(ts_ms, "info", "fill_cursor", str(ts_ms))
+
     def last_report_day(self) -> str:
         row = self.conn.execute(
             "SELECT message FROM events WHERE kind='daily_report' ORDER BY id DESC LIMIT 1"
