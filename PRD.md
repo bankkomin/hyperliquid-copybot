@@ -25,16 +25,16 @@ From 9 months of on-chain data (1,343 orders, 341 fills, Nov 2025 → Aug 2026):
 
 | Fact | Number | Design consequence |
 |---|---|---|
-| Style | Long-only laddered accumulation ("grid"-looking) | Copy **position state**, not every fill |
-| Maker fills | 84% | If we taker-copy, we pay costs he doesn't → maker-first execution |
-| Realized grid PnL | ≈ +$500 net of funding+fees (noise) | The copyable alpha is the **directional position**, not the churn |
+| Style | Long-only laddered accumulation ("grid"-looking) | The ladder IS the strategy → mirror his **resting orders**, not just fills |
+| Maker fills | 84% | Resting at his exact prices gives us the same maker fills — never taker-chase |
+| Realized grid PnL | ≈ +$500 net of funding+fees (noise) | The copyable alpha is the **directional accumulation**, executed via the ladder |
 | Unrealized PnL | +$20.6k on 1.336 BTC @ $64,249 avg entry | Late copier buys HIS entry at TODAY's price — no entry-price edge |
-| Stop losses | **ZERO** (no trigger orders, no TP/SL, ever) | **We must add our own stop overlay** |
-| Behavior in drawdown | Averages down, pyramids size (0.05 → 0.20 BTC deeper) | Resting ladder would grow him ~40% bigger into a 28% crash — cap this |
+| Stop losses | **ZERO** (no trigger orders, no TP/SL, ever) | His risk management is the ladder itself — mirrored faithfully; our only safety net is the account-level kill-switch (§6 M1) |
+| Behavior in drawdown | Averages down, pyramids size (0.05 → 0.20 BTC deeper) | Mirrored proportionally by design — this is the accepted risk profile |
 | Fill frequency | ~1.2 fills/day, order batches every 1–2 days | Low-frequency; polling + WS both viable; latency is NOT critical |
 | Funding paid | −$1,765 over 9 months (long perp) | Funding monitor needed; long-bias bleeds carry |
 
-> **Key insight:** this leader survived because BTC V-shaped. A copybot that mirrors him 1:1 inherits an **uncapped average-down martingale with no stop**. The risk layer is not optional polish — it is the product.
+> **Key insight:** this leader survived because BTC V-shaped. A 1:1 mirror inherits an **average-down martingale with no stops — by deliberate choice (v3)**. The mirror-parity gate guarantees we are never MORE exposed than him proportionally, and the −35% kill-switch is the single deviation that protects the account from destruction.
 
 ---
 
