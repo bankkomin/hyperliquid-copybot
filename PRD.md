@@ -1,6 +1,6 @@
 # PRD — Hyperliquid Copybot for `0xdae4...7637` ("Paul Wei")
 
-**Status:** Draft v2 · 2026-08-27
+**Status:** Draft v2.1 · 2026-08-27
 **Repo:** `bankkomin/hyperliquid-copybot`
 **Leader:** [`0xdae4df7207feb3b350e4284c8efe5f7dac37f637`](https://hyperbot.network/trader/0xdae4df7207feb3b350e4284c8efe5f7dac37f637) — BTC perp only, tracked at [paul.catseye.today](https://paul.catseye.today/)
 
@@ -370,6 +370,16 @@ CREATE TABLE equity_curve (
   drawdown_pct REAL, funding_cum REAL, fees_cum REAL, realized_cum REAL
 );
 
+-- Leader's fills and resting orders (for the catseye-style chart overlays, §11.1)
+CREATE TABLE leader_fills (
+  tid INTEGER PRIMARY KEY, ts INTEGER, side TEXT, px REAL, sz REAL,
+  crossed INTEGER, dir TEXT                    -- 'Open Long', 'Close Long', ...
+);
+CREATE TABLE leader_open_orders (
+  snapshot_ts INTEGER, oid INTEGER, side TEXT, px REAL, sz REAL,
+  PRIMARY KEY (snapshot_ts, oid)               -- full ladder re-recorded when it changes
+);
+
 -- State transitions and alerts (drives the dashboard banner + Telegram)
 CREATE TABLE events (
   id INTEGER PRIMARY KEY, ts INTEGER,
@@ -394,12 +404,24 @@ CREATE TABLE events (
 
 Runs as a daemon thread inside the bot process (one process = one pid = simple `.bat` lifecycle). Reads SQLite only, refreshes every 15 s via `dcc.Interval`. Follows the option bot's snapshot pattern: one cached read per refresh, zero queries in callbacks.
 
-Example layout:
+**Look & feel: modeled on [paul.catseye.today](https://paul.catseye.today/)** — dark theme, price chart first with fills and order ladders drawn *on* the candles, time-series for leverage and cumulative PnL below, then the copybot's own risk/decision panels. Full layout, top to bottom:
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
 │  ● NORMAL   mode: PAPER   ws: connected 12s ago   leader data: 43s   │  ← state banner
 │             (green NORMAL / yellow WARNING / orange REDUCING / red HALT)
+├──────────────────────────────────────────────────────────────────────┤
+│  BTC PRICE · CANDLES (catseye-style)         [1d] [4h] [1h] [15m]    │
+│                                                                      │
+│      Hyperliquid candles                                  [chart]    │
+│      ─ ─ ─  leader resting buy ladder (green dashed lines)           │
+│      ─ ─ ─  our resting orders (bright green/red lines)              │
+│      ▲▼ leader fills (solid marker)  △▽ our fills (hollow marker)    │
+│      ───    our stop-overlay levels −15% / −25% (red lines)          │
+│      Order lines: [Off] [Top 4] [Top 8] [All]   Fills: [All][Taker]  │
+├──────────────────────────────────────────────────────────────────────┤
+│  ACTUAL LEVERAGE % (ours vs leader, signed)               [chart]    │
+│  CUMULATIVE PnL  [USD | BTC]  (ours vs leader × scale)    [chart]    │
 ├───────────────────────────┬──────────────────────────────────────────┤
 │  COPY ACCOUNT             │  LEADER (0xdae4...7637)                  │
 │  Equity      $10,241      │  Equity        $66,435                   │
@@ -421,21 +443,45 @@ Example layout:
 │  12:19:44  ws_fill  Δ+0.031  VETO    R4_add_throttle                 │
 │  11:58:02  poll     Δ 0.000  skip_dust                               │
 ├──────────────────────────────────────────────────────────────────────┤
+│  ACTIVE ORDERS (ours + leader ladder, catseye-style table)           │
+│  Who     Side  Price     BTC Size  Notional  % of Acct  Created      │
+│  leader  Buy   $57,860   0.20000   $11,572    17.4%     08-21 13:30  │
+│  ours    Buy   $59,715   0.01806   $1,078     10.5%     08-27 09:12  │
+├──────────────────────────────────────────────────────────────────────┤
 │  OUR FILLS (maker % · fees · realized)     LEADER FEED (his fills)   │
 └──────────────────────────────────────────────────────────────────────┘
 ```
+
+Chart section — what we copy from catseye and what we defer:
+
+| Catseye feature | v1 | How |
+|---|---|---|
+| Candles 1d/4h/1h/15m (Hyperliquid's own data) | ✓ | `candleSnapshot` info API, fetched on refresh, cached in memory (not stored in DB) |
+| Order lines on chart (Off/Top 4/8/All) | ✓ | `leader_open_orders` + our `orders` → horizontal dashed lines |
+| Fill markers, buy/sell colored, taker filter | ✓ | `leader_fills` + our `fills` → triangle markers; ours hollow so the two accounts are distinguishable at a glance |
+| Stop-overlay levels drawn on the chart | ✓ (ours only — catseye has none because the leader has none) | computed from position entry + §6.2 M1 levels |
+| Leverage % time series (signed) | ✓ | `snapshots` both accounts, two lines |
+| Cumulative PnL with USD/BTC toggle | ✓ | `equity_curve` (ours) vs leader `snapshots` × scale |
+| Playback / replay of history | ✗ defer to M4 | nice-to-have; SQLite history makes it possible later |
+| EMA/SMA/Bollinger indicators | ✗ defer to M4 | not needed to supervise a copybot |
+
+All charts are Plotly (one stack, same as the option bot — no need for catseye's lightweight-charts dependency; Plotly candlestick + shapes covers everything above).
 
 Panel spec:
 
 | Panel | Source table | Purpose |
 |---|---|---|
 | State banner | `events`, latest `snapshots` | One glance: alive? which risk state? data fresh? |
+| Price + candles with overlays | `candleSnapshot` API, `leader_fills`, `leader_open_orders`, `orders`, `fills` | The catseye view, both accounts on one chart: what he did, what we copied, where our stops sit |
+| Leverage % chart | `snapshots` | Are we tracking his exposure within our 1.5× clamp? |
+| Cumulative PnL chart (USD/BTC) | `equity_curve`, leader `snapshots` | Copy P&L vs `leader × scale` benchmark over time |
 | Copy vs Leader cards | `snapshots` | The core question: are we actually mirroring him? |
 | Equity curves (indexed) | `equity_curve`, leader `snapshots` | Is copy P&L tracking leader P&L after costs? |
 | Drawdown gauge | `equity_curve` | Distance to the −20% kill-switch, visually |
 | Risk gate activity | `decisions` (vetoes), monitor state | Proof the gates work; throttle budget remaining |
 | Decisions table | `decisions` | The audit trail, live — includes no-ops |
-| Fills tables | `fills` | Maker ratio (target ≥ 60%), fees paid, slippage vs leader's price |
+| Active orders table | `leader_open_orders`, `orders` | Catseye-style: side, price, size, notional, % of acct, created — both accounts interleaved |
+| Fills tables | `fills`, `leader_fills` | Maker ratio (target ≥ 60%), fees paid, slippage vs leader's price |
 
 ### 11.2 Kill switch on the dashboard
 
