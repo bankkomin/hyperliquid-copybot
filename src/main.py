@@ -317,13 +317,30 @@ def make_broker(cfg: Config, store: Store):
 
 
 def startup(deps: Deps) -> None:
-    """Never trust orders left by a dead process."""
+    """Recover from however the last process died.
+
+    Live: cancel everything first — orders left by a dead process are unmanaged
+    exposure, and re-mirroring from a clean book is the only way to guarantee no
+    duplicates. Paper: the broker rehydrates its own book from SQLite, so the
+    mirror rows still describe real orders and must NOT be cleared.
+    """
+    now_ms = int(time.time() * 1000)
     if deps.cfg.mode == "live":
         n = deps.broker.cancel_all()
         for loid in deps.store.mirror_get():
-            deps.store.mirror_close(loid, int(time.time() * 1000), "restart")
+            deps.store.mirror_close(loid, now_ms, "restart")
         log.info("startup_recovery", canceled=n)
-    log.info("startup", mode=deps.cfg.mode, state=deps.store.latest_risk_state())
+
+    state = deps.store.latest_risk_state()
+    if state == RiskState.HALT.value:
+        # HALT survives restarts. Say so loudly: the operator must clear it with
+        # a manual_reset event, and until then we only observe.
+        deps.store.record_event(
+            now_ms, "critical", "startup_halted",
+            "restarted while HALTED — insert a manual_reset event to resume",
+        )
+        log.critical("startup_while_halted")
+    log.info("startup", mode=deps.cfg.mode, state=state)
 
 
 async def run(cfg: Config) -> None:
@@ -342,7 +359,35 @@ async def run(cfg: Config) -> None:
             _maybe_daily_report(deps, now_ms)
         except Exception:
             log.exception("cycle_failed")
-        await asyncio.sleep(cfg.storage.snapshot_interval_s)
+        if await _sleep_unless_stopped(deps, cfg.storage.snapshot_interval_s):
+            shutdown(deps)
+            return
+
+
+async def _sleep_unless_stopped(deps: Deps, seconds: int, slice_s: int = 2) -> bool:
+    """Sleep between cycles, waking early for a stop request so the operator does
+    not wait a whole cycle for the bot to come down."""
+    for _ in range(max(1, seconds // slice_s)):
+        if deps.store.stop_requested():
+            return True
+        await asyncio.sleep(slice_s)
+    return deps.store.stop_requested()
+
+
+def shutdown(deps: Deps) -> None:
+    """Graceful stop: pull our resting orders so nothing is left unattended, but
+    KEEP the position — stopping the bot must not liquidate a healthy book."""
+    now_ms = int(time.time() * 1000)
+    canceled = 0
+    if deps.cfg.mode == "live":
+        canceled = deps.broker.cancel_all()
+        for loid in deps.store.mirror_get():
+            deps.store.mirror_close(loid, now_ms, "shutdown")
+    pos = deps.broker.state(deps.last_leader.mark_px if deps.last_leader else 0.0, now_ms).position
+    deps.store.record_event(
+        now_ms, "info", "stopped", f"canceled={canceled} position_kept={pos}"
+    )
+    log.info("shutdown_complete", canceled=canceled, position_kept=pos)
 
 
 def _maybe_daily_report(deps: Deps, now_ms: int) -> None:

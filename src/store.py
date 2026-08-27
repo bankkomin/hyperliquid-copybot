@@ -179,6 +179,18 @@ class Store:
         self.conn.commit()
         return new != cur
 
+    def stop_requested(self) -> bool:
+        """stop_copybot.bat asks for a graceful stop through the DB, not a signal:
+        pythonw has no window to receive WM_CLOSE, so taskkill can only force-kill
+        and a finally-block shutdown would never run."""
+        return (
+            self.conn.execute(
+                "SELECT 1 FROM events WHERE kind='stop_requested' AND id > "
+                "(SELECT COALESCE(MAX(id),0) FROM events WHERE kind='stopped')"
+            ).fetchone()
+            is not None
+        )
+
     def fill_cursor(self) -> int:
         """Where our own fill ingestion left off. Persisted so a restart does not
         re-walk the account's entire fill history."""
