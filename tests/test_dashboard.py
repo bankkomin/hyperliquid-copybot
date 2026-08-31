@@ -164,3 +164,62 @@ def test_build_view_renders_at_a_past_moment(tmp_path, cfg_paper):
     assert "[REPLAY]" in past[1].figure.layout.title.text
     assert any("57,860" in a.text for a in past[1].figure.layout.annotations)
     assert not any("62,944" in a.text for a in past[1].figure.layout.annotations)
+
+
+def test_replay_frame_does_not_drift_as_new_data_arrives(tmp_path, cfg_paper):
+    """Regression: the slider was a PERCENTAGE of a growing range, so a pinned
+    replay position crept forward on every refresh with no user action."""
+    from src.models import AccountState
+
+    st, db = _history(tmp_path)
+    lo, hi = replay_range(db)
+    pinned = slider_to_ts(50, lo, hi)
+
+    st.record_snapshot("copy", AccountState(  # the bot keeps running
+        equity=11_000, position=0.3, entry_px=79_000.0, mark_px=80_000.0,
+        fetched_at_ms=9_000))
+    # The stored timestamp is absolute, so the frame is identical afterwards.
+    assert snapshot_at(db, "copy", pinned) == snapshot_at(db, "copy", pinned)
+    assert slider_to_ts(50, lo, hi) == pinned  # same inputs, same answer
+
+
+def test_halt_button_is_disabled_during_replay(tmp_path, cfg_paper):
+    """The button acts on the LIVE account: reviewing a past HALT must not offer
+    a control that flattens a healthy book today."""
+    st, db = _history(tmp_path)
+    live_banner = build_view(db, cfg_paper, at_ts=None)[0]
+    past_banner = build_view(db, cfg_paper, at_ts=2000)[0]
+    live_btn = live_banner.children[-1]
+    past_btn = past_banner.children[-1]
+    assert live_btn.disabled is False and live_btn.children == "HALT NOW"
+    assert past_btn.disabled is True and "live only" in past_btn.children
+
+
+def test_ladder_at_keeps_an_adopted_order_with_no_orders_row(tmp_path):
+    """Regression: an INNER JOIN dropped rungs adopted after a transport timeout
+    — exactly the ambiguous order the operator most needs to see."""
+    st = Store(tmp_path / "t.db")
+    db = ReadOnlyDB(str(tmp_path / "t.db"))
+    st.mirror_put(1, 777, 57_860.0, 0.2, 0.03, 0.15, 1000)  # no orders row
+    _, ours = ladder_at(db, 2000)
+    assert [round(p) for _, p, _ in ours] == [57_860]
+
+
+def test_ladder_at_does_not_double_count_a_shared_our_oid(tmp_path):
+    """Regression: a rejected cancel leaves the row open, so the next cycle can
+    create a second open mirror row for the SAME resting order."""
+    st = Store(tmp_path / "t.db")
+    db = ReadOnlyDB(str(tmp_path / "t.db"))
+    st.conn.execute("INSERT INTO orders(oid,ts,side,px,sz,exec_style,status)"
+                    " VALUES (777,1000,'B',57860.0,0.03,'maker','open')")
+    st.conn.commit()
+    st.mirror_put(1, 777, 57_860.0, 0.2, 0.03, 0.15, 1000)
+    st.mirror_put(1, 777, 57_860.0, 0.2, 0.03, 0.15, 1500)  # duplicate
+    _, ours = ladder_at(db, 2000)
+    assert len(ours) == 1
+
+
+def test_request_halt_reports_failure_instead_of_raising(tmp_path):
+    """A HALT press that cannot be written must say so, not vanish."""
+    db = ReadOnlyDB(str(tmp_path / "no" / "such" / "dir" / "t.db"))
+    assert db.request_halt(1000) is False

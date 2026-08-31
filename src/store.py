@@ -54,6 +54,13 @@ CREATE TABLE IF NOT EXISTS events(
   id INTEGER PRIMARY KEY, ts INTEGER, level TEXT, kind TEXT, message TEXT);
 CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind, ts);
 CREATE INDEX IF NOT EXISTS idx_decisions_ts ON decisions(ts);
+-- The dashboard sorts/filters these by time on every refresh and every replay
+-- frame; without indexes each render full-scans them while the bot holds a
+-- write lock, and a slow read there stalls the cycle that may be enforcing HALT.
+CREATE INDEX IF NOT EXISTS idx_fills_ts ON fills(ts);
+CREATE INDEX IF NOT EXISTS idx_leader_fills_ts ON leader_fills(ts);
+CREATE INDEX IF NOT EXISTS idx_snapshots_who_ts ON snapshots(who, ts);
+CREATE INDEX IF NOT EXISTS idx_mirror_created ON mirror_map(created_ts, closed_ts);
 """
 
 # A ws_lost outage is "open" until a ws_recovered row lands after it.

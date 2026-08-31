@@ -99,17 +99,27 @@ class ReadOnlyDB:
         """Rows for display panels, where empty and unreadable look the same."""
         return self.q(sql, args) or []
 
-    def request_halt(self, ts_ms: int) -> None:
-        """The dashboard's ONLY write. The bot consumes it on the next cycle."""
-        conn = sqlite3.connect(self.path, timeout=5)
+    def request_halt(self, ts_ms: int) -> bool:
+        """The dashboard's ONLY write. The bot consumes it on the next cycle.
+
+        Returns whether it was actually recorded. During the crash this button
+        exists for, the bot is committing every cycle and the write can lose the
+        lock race — an operator who sees no acknowledgement must be told the
+        press did NOT land, not left guessing.
+        """
         try:
-            conn.execute(
-                "INSERT INTO events(ts,level,kind,message) VALUES (?,?,?,?)",
-                (ts_ms, "critical", "halt_requested", "dashboard button"),
-            )
-            conn.commit()
-        finally:
-            conn.close()
+            conn = sqlite3.connect(self.path, timeout=5)
+            try:
+                conn.execute(
+                    "INSERT INTO events(ts,level,kind,message) VALUES (?,?,?,?)",
+                    (ts_ms, "critical", "halt_requested", "dashboard button"),
+                )
+                conn.commit()
+                return True
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            return False
 
 
 def _card(title, rows):
@@ -165,15 +175,12 @@ def resolve_state(rows) -> str:
 
 
 def snapshot_at(db: ReadOnlyDB, who: str, at_ts: int | None = None):
-    sql = (
+    # COALESCE(?, ts) makes "no bound" and "bounded" the same query.
+    rows = db.rows(
         "SELECT equity, position_btc, entry_px, upnl, leverage, mark_px FROM snapshots "
-        "WHERE who=?"
+        "WHERE who=? AND ts<=COALESCE(?,ts) ORDER BY ts DESC LIMIT 1",
+        (who, at_ts),
     )
-    args: tuple = (who,)
-    if at_ts is not None:
-        sql += " AND ts<=?"
-        args += (at_ts,)
-    rows = db.rows(sql + " ORDER BY ts DESC LIMIT 1", args)
     return rows[0] if rows else None
 
 
@@ -194,35 +201,45 @@ def ladder_at(db: ReadOnlyDB, at_ts: int | None = None):
     )
     # `orders.status` only records the CURRENT state, so our historical book comes
     # from the mirror_map lifecycle (created_ts .. closed_ts) instead.
+    # LEFT JOIN, not INNER: an order adopted after a transport timeout has a
+    # mirror row but no `orders` row, and that is precisely the rung the operator
+    # most needs to see. GROUP BY our_oid collapses the duplicate rows a rejected
+    # cancel leaves behind, so one resting order is never drawn twice.
     ours = db.rows(
-        "SELECT o.side, m.px, m.our_sz FROM mirror_map m JOIN orders o ON o.oid=m.our_oid "
+        "SELECT COALESCE(o.side,'B'), m.px, m.our_sz "
+        "FROM mirror_map m LEFT JOIN orders o ON o.oid=m.our_oid "
         "WHERE m.created_ts<=? AND (m.closed_ts IS NULL OR m.closed_ts>?) "
-        "ORDER BY m.px DESC",
+        "GROUP BY m.our_oid ORDER BY m.px DESC",
         (at_ts, at_ts),
     )
     return leader, ours
 
 
 def state_at(db: ReadOnlyDB, at_ts: int | None = None) -> str:
-    sql = "SELECT kind, message FROM events WHERE kind IN ('state_change','manual_reset')"
-    args: tuple = ()
-    if at_ts is not None:
-        sql += " AND ts<=?"
-        args = (at_ts,)
-    return resolve_state(db.q(sql + " ORDER BY id DESC LIMIT 1", args))
+    return resolve_state(
+        db.q(
+            "SELECT kind, message FROM events "
+            "WHERE kind IN ('state_change','manual_reset') AND ts<=COALESCE(?,ts) "
+            "ORDER BY id DESC LIMIT 1",
+            (at_ts,),
+        )
+    )
 
 
 def replay_range(db: ReadOnlyDB) -> tuple[int, int]:
     """(first, last) recorded timestamps; (0, 0) when there is no history yet."""
-    rows = db.rows("SELECT MIN(ts), MAX(ts) FROM snapshots")
-    if not rows or rows[0][0] is None:
-        return 0, 0
-    return int(rows[0][0]), int(rows[0][1])
+    rows = db.rows("SELECT COALESCE(MIN(ts),0), COALESCE(MAX(ts),0) FROM snapshots")
+    return (int(rows[0][0]), int(rows[0][1])) if rows else (0, 0)
 
 
 def slider_to_ts(pct: float, lo: int, hi: int) -> int | None:
-    """Slider position -> timestamp. 100 (or no history) means LIVE."""
-    if pct >= 100 or not hi or hi <= lo:
+    """Slider position -> absolute timestamp. 100 means LIVE.
+
+    Resolved ONCE when the operator moves the slider; the result is then held as
+    an absolute time. Re-deriving it per refresh would walk the view forward as
+    `hi` grows, drifting a pinned frame without anyone touching it.
+    """
+    if pct >= 100 or hi <= lo:
         return None
     return int(lo + (hi - lo) * pct / 100)
 
@@ -257,11 +274,19 @@ def build_view(db: ReadOnlyDB, cfg: Config, at_ts: int | None = None):
                 style={"color": "#d4a72c" if at_ts else MUTED, "marginLeft": 24,
                        "fontWeight": 700 if at_ts else 400},
             ),
+            # DISABLED while replaying. The button acts on the LIVE account, so
+            # an operator reviewing yesterday's HALT could otherwise click what
+            # looks like a historical control and flatten a healthy book today.
             html.Button(
-                "HALT NOW", id="halt-btn", n_clicks=0,
-                style={"float": "right", "background": RED, "color": "white",
-                       "border": "none", "padding": "6px 16px", "borderRadius": 6,
-                       "cursor": "pointer", "fontWeight": 700},
+                "HALT NOW" if at_ts is None else "HALT (live only)",
+                id="halt-btn", n_clicks=0, disabled=at_ts is not None,
+                style={"float": "right",
+                       "background": RED if at_ts is None else PANEL,
+                       "color": "white" if at_ts is None else MUTED,
+                       "border": "none" if at_ts is None else f"1px solid {MUTED}",
+                       "padding": "6px 16px", "borderRadius": 6,
+                       "cursor": "pointer" if at_ts is None else "not-allowed",
+                       "fontWeight": 700},
             ),
         ],
         style={"background": PANEL, "padding": 14, "borderRadius": 8, "marginBottom": 12},
@@ -285,8 +310,9 @@ def build_view(db: ReadOnlyDB, cfg: Config, at_ts: int | None = None):
     shapes, annotations = order_overlay_shapes(overlay)
     for f_who, marker in (("leader_fills", "triangle-up"), ("fills", "triangle-up-open")):
         fills = db.rows(
-            f"SELECT ts, px, side FROM {f_who} WHERE ts<=? ORDER BY ts DESC LIMIT 200",
-            (at_ts if at_ts else 1 << 62,),
+            f"SELECT ts, px, side FROM {f_who} WHERE ts<=COALESCE(?,ts) "
+            "ORDER BY ts DESC LIMIT 200",
+            (at_ts,),
         )
         if fills:
             fig.add_trace(
@@ -309,10 +335,14 @@ def build_view(db: ReadOnlyDB, cfg: Config, at_ts: int | None = None):
         + (" [REPLAY]" if at_ts else ""),
     )
 
-    curve = db.rows(
-        "SELECT ts, equity, drawdown_pct FROM equity_curve WHERE ts<=? ORDER BY ts",
-        (at_ts if at_ts else 1 << 62,),
-    )
+    # Newest 5,000 points, oldest-first for plotting: after weeks of 60s cycles
+    # an unbounded select serialises tens of thousands of points to the browser
+    # on every single refresh.
+    curve = list(reversed(db.rows(
+        "SELECT ts, equity, drawdown_pct FROM equity_curve WHERE ts<=COALESCE(?,ts) "
+        "ORDER BY ts DESC LIMIT 5000",
+        (at_ts,),
+    )))
     eq_fig = go.Figure()
     if curve:
         eq_fig.add_trace(
@@ -352,8 +382,8 @@ def build_view(db: ReadOnlyDB, cfg: Config, at_ts: int | None = None):
 
     decisions = db.rows(
         "SELECT ts, trigger, action, veto_reason, risk_state FROM decisions "
-        "WHERE ts<=? ORDER BY id DESC LIMIT 15",
-        (at_ts if at_ts else 1 << 62,),
+        "WHERE ts<=COALESCE(?,ts) ORDER BY id DESC LIMIT 15",
+        (at_ts,),
     )
     active = html.Div(
         [
@@ -382,12 +412,12 @@ def build_view(db: ReadOnlyDB, cfg: Config, at_ts: int | None = None):
     return [banner, dcc.Graph(figure=fig), dcc.Graph(figure=eq_fig), cards, active, recent]
 
 
-def _replay_bar(cfg: Config):
-    """Scrub back through recorded history. 100 = live.
+def _replay_bar():
+    """Scrub back through recorded history.
 
-    ponytail: the slider is a PERCENTAGE of the recorded range, not a timestamp,
-    so its bounds never change as new data arrives and nothing fights the user
-    mid-drag.
+    The slider only SEEDS a position; the authoritative value is an absolute
+    timestamp in `at-ts`. Deriving the time from the slider percentage on every
+    refresh would walk a pinned frame forward as new data extends the range.
     """
     btn = {"background": PANEL, "color": TEXT, "border": f"1px solid {MUTED}",
            "padding": "4px 12px", "borderRadius": 6, "cursor": "pointer",
@@ -398,20 +428,21 @@ def _replay_bar(cfg: Config):
                 [
                     html.Span("REPLAY", style={"color": MUTED, "fontSize": 12,
                                                "letterSpacing": 1, "marginRight": 16}),
-                    html.Button("< step", id="step-back", n_clicks=0, style=btn),
+                    html.Button("<< 1h", id="back-hour", n_clicks=0, style=btn),
+                    html.Button("< cycle", id="step-back", n_clicks=0, style=btn),
                     html.Button("play", id="play-btn", n_clicks=0, style=btn),
-                    html.Button("step >", id="step-fwd", n_clicks=0, style=btn),
-                    html.Button("latest", id="live-btn", n_clicks=0, style=btn),
+                    html.Button("cycle >", id="step-fwd", n_clicks=0, style=btn),
+                    html.Button("LIVE", id="live-btn", n_clicks=0, style=btn),
                     html.Span(id="replay-label",
                               style={"color": MUTED, "marginLeft": 16, "fontSize": 13}),
                 ],
                 style={"marginBottom": 8},
             ),
-            dcc.Slider(id="replay-slider", min=0, max=100, step=0.5, value=100,
+            dcc.Slider(id="replay-slider", min=0, max=100, step=0.1, value=100,
                        marks=None, tooltip={"placement": "bottom"},
                        updatemode="mouseup"),
             dcc.Interval(id="play-tick", interval=1000, disabled=True),
-            dcc.Store(id="playing", data=False),
+            dcc.Store(id="at-ts", data=None),
         ],
         style={"background": PANEL, "padding": "14px 20px", "borderRadius": 8,
                "marginBottom": 12},
@@ -420,11 +451,12 @@ def _replay_bar(cfg: Config):
 
 def make_app(cfg: Config) -> dash.Dash:
     db = ReadOnlyDB(cfg.storage.db_path)
+    step_ms = cfg.storage.snapshot_interval_s * 1000  # one cycle per step
     app = dash.Dash(__name__, title="KK Copybot")
     app.layout = html.Div(
         [
             html.H2("Hyperliquid Copybot", style={"color": TEXT, "marginBottom": 4}),
-            _replay_bar(cfg),
+            _replay_bar(),
             html.Div(id="content"),
             dcc.Interval(id="tick", interval=cfg.dashboard.refresh_s * 1000),
             html.Div(id="halt-ack", style={"color": RED, "marginTop": 8}),
@@ -434,14 +466,54 @@ def make_app(cfg: Config) -> dash.Dash:
     )
 
     @app.callback(
+        Output("at-ts", "data"),
+        Output("play-tick", "disabled"),
+        Output("play-btn", "children"),
+        Input("replay-slider", "value"),
+        Input("back-hour", "n_clicks"),
+        Input("step-back", "n_clicks"),
+        Input("step-fwd", "n_clicks"),
+        Input("live-btn", "n_clicks"),
+        Input("play-btn", "n_clicks"),
+        Input("play-tick", "n_intervals"),
+        State("at-ts", "data"),
+        State("play-tick", "disabled"),
+        prevent_initial_call=True,
+    )
+    def move(pct, _bh, _b, _f, _l, _p, _tick, at_ts, paused):
+        who = dash.ctx.triggered_id
+        lo, hi = replay_range(db)
+
+        if who == "live-btn":
+            return None, True, "play"
+        if who == "play-btn":
+            paused = not paused
+            # Pressing play from LIVE rewinds an hour so there is something to watch.
+            if not paused and at_ts is None and hi:
+                at_ts = max(lo, hi - 3_600_000)
+            return at_ts, paused, ("play" if paused else "pause")
+        if who == "replay-slider":
+            return slider_to_ts(pct if pct is not None else 100, lo, hi), paused,                 ("play" if paused else "pause")
+
+        # Stepping and playing move in TIME, not in percent: one cycle per step,
+        # so the buttons mean the same thing on day 1 and on day 14.
+        base = at_ts if at_ts is not None else hi
+        delta = {"back-hour": -3_600_000, "step-back": -step_ms}.get(who, step_ms)
+        nxt = base + delta
+        if nxt >= hi or nxt <= 0:
+            # Reaching the end stops playback instead of silently becoming LIVE
+            # mid-animation with the button still reading "pause".
+            return (None, True, "play") if delta > 0 else (max(lo, nxt), paused,
+                                                           "play" if paused else "pause")
+        return max(lo, nxt), paused, ("play" if paused else "pause")
+
+    @app.callback(
         Output("content", "children"),
         Output("replay-label", "children"),
         Input("tick", "n_intervals"),
-        Input("replay-slider", "value"),
+        Input("at-ts", "data"),
     )
-    def refresh(_n, pct):
-        lo, hi = replay_range(db)
-        at_ts = slider_to_ts(pct if pct is not None else 100, lo, hi)
+    def refresh(_n, at_ts):
         label = (
             "live"
             if at_ts is None
@@ -450,47 +522,16 @@ def make_app(cfg: Config) -> dash.Dash:
         return build_view(db, cfg, at_ts), label
 
     @app.callback(
-        Output("playing", "data"),
-        Output("play-btn", "children"),
-        Output("play-tick", "disabled"),
-        Input("play-btn", "n_clicks"),
-        Input("live-btn", "n_clicks"),
-        State("playing", "data"),
-        prevent_initial_call=True,
-    )
-    def toggle_play(_p, _l, playing):
-        if dash.ctx.triggered_id == "live-btn":
-            return False, "play", True
-        playing = not playing
-        return playing, ("pause" if playing else "play"), not playing
-
-    @app.callback(
-        Output("replay-slider", "value"),
-        Input("play-tick", "n_intervals"),
-        Input("step-back", "n_clicks"),
-        Input("step-fwd", "n_clicks"),
-        Input("live-btn", "n_clicks"),
-        State("replay-slider", "value"),
-        prevent_initial_call=True,
-    )
-    def move(_tick, _b, _f, _l, pct):
-        pct = 100 if pct is None else pct
-        who = dash.ctx.triggered_id
-        if who == "live-btn":
-            return 100
-        if who == "step-back":
-            return max(0, pct - 0.5)
-        if who == "step-fwd":
-            return min(100, pct + 0.5)
-        return min(100, pct + 0.5)  # play tick
-
-    @app.callback(
         Output("halt-ack", "children"),
         Input("halt-btn", "n_clicks"),
+        State("at-ts", "data"),
         prevent_initial_call=True,
     )
-    def halt(_n_clicks):
-        db.request_halt(int(time.time() * 1000))
-        return "HALT requested - the bot will cancel and flatten on its next cycle."
+    def halt(_n_clicks, at_ts):
+        if at_ts is not None:
+            return "Replay is showing a past moment - switch to LIVE to halt."
+        if db.request_halt(int(time.time() * 1000)):
+            return "HALT requested - the bot will cancel and flatten on its next cycle."
+        return "HALT NOT RECORDED (database busy) - press again."
 
     return app
