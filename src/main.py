@@ -187,13 +187,14 @@ async def _halt_cycle(deps: Deps, now_ms: int) -> None:
         mark = (deps.last_leader.mark_px if deps.last_leader else 0.0) or deps.store.last_mark()
 
     ours = deps.broker.state(mark, now_ms)
+    if ours.position or not deps.broker.book_is_clean():
+        _enforce_halt(deps, ours, mark, now_ms)
+        ours = deps.broker.state(mark, now_ms)  # post-flatten
     # Keep writing snapshots/equity: otherwise every operator-facing surface
     # freezes at its pre-HALT values, and the person deciding whether the HALT
     # worked is reading numbers from before it.
     deps.store.record_snapshot("copy", ours)
     deps.store.update_equity(now_ms, ours.equity)
-    if ours.position or not deps.broker.book_is_clean():
-        _enforce_halt(deps, ours, mark, now_ms)
 
 
 async def cycle(deps: Deps, now_ms: int) -> None:

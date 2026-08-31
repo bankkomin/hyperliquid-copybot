@@ -172,9 +172,14 @@ class Store:
             [(o.oid, o.side, o.px, o.sz, ts_ms) for o in orders],
         )
         if new != cur:
+            # An EMPTY ladder must still leave a marker, or replay would show the
+            # previous ladder forever: "no rows at this ts" and "he had no orders"
+            # are otherwise indistinguishable. px=0 rows are filtered on read.
+            rows = [(ts_ms, o.oid, o.side, o.px, o.sz) for o in orders] or [
+                (ts_ms, 0, "B", 0.0, 0.0)
+            ]
             self.conn.executemany(
-                "INSERT OR REPLACE INTO leader_open_orders VALUES (?,?,?,?,?)",
-                [(ts_ms, o.oid, o.side, o.px, o.sz) for o in orders],
+                "INSERT OR REPLACE INTO leader_open_orders VALUES (?,?,?,?,?)", rows
             )
         self.conn.commit()
         return new != cur

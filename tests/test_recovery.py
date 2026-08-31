@@ -184,3 +184,19 @@ def test_live_shutdown_cancels_resting_orders(tmp_path, cfg_live):
     shutdown(deps)
     broker.cancel_all.assert_called_once()
     assert st.mirror_get() == {}
+
+
+def test_halt_snapshot_reflects_the_post_flatten_state(tmp_path, cfg_paper, make_deps):
+    """The snapshot a HALT cycle records must be what the account looks like
+    AFTER the flatten — otherwise replay and the dashboard show the position the
+    kill-switch just closed."""
+    st = Store(tmp_path / "t.db")
+    deps = make_deps(st, FakeWatcher(leader_state(position=0.0)))
+    asyncio.run(cycle(deps, now_ms=1000))
+    deps.broker.market_fill("B", 0.05, 79_660, 1500)
+    st.record_event(1600, "critical", "state_change", "HALT")
+    asyncio.run(cycle(deps, now_ms=2000))
+    pos = st.conn.execute(
+        "SELECT position_btc FROM snapshots WHERE who='copy' ORDER BY ts DESC LIMIT 1"
+    ).fetchone()[0]
+    assert pos == 0.0

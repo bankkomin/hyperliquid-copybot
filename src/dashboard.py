@@ -12,7 +12,7 @@ import urllib.request
 
 import dash
 import plotly.graph_objects as go
-from dash import Input, Output, dcc, html
+from dash import Input, Output, State, dcc, html
 
 from src.config import Config
 
@@ -158,32 +158,90 @@ def resolve_state(rows) -> str:
     return "NORMAL" if kind == "manual_reset" else message
 
 
-def _snapshot(db: ReadOnlyDB, who: str):
-    rows = db.rows(
+# ---- "as of" reconstruction (replay) -------------------------------------
+#
+# Every panel can be rendered either live or as it stood at some past moment.
+# `at_ts=None` means now; otherwise every query is bounded by that timestamp.
+
+
+def snapshot_at(db: ReadOnlyDB, who: str, at_ts: int | None = None):
+    sql = (
         "SELECT equity, position_btc, entry_px, upnl, leverage, mark_px FROM snapshots "
-        "WHERE who=? ORDER BY ts DESC LIMIT 1",
-        (who,),
+        "WHERE who=?"
     )
+    args: tuple = (who,)
+    if at_ts is not None:
+        sql += " AND ts<=?"
+        args += (at_ts,)
+    rows = db.rows(sql + " ORDER BY ts DESC LIMIT 1", args)
     return rows[0] if rows else None
 
 
-def build_view(db: ReadOnlyDB, cfg: Config):
-    """All panels for one refresh. Pure-ish: DB in, Dash children out."""
-    leader, ours = _snapshot(db, "leader"), _snapshot(db, "copy")
-    state = resolve_state(
-        db.q(
-            "SELECT kind, message FROM events "
-            "WHERE kind IN ('state_change','manual_reset') ORDER BY id DESC LIMIT 1"
-        )
+def ladder_at(db: ReadOnlyDB, at_ts: int | None = None):
+    """(leader_orders, our_orders) as (side, px, sz), live or as of `at_ts`."""
+    if at_ts is None:
+        leader = db.rows("SELECT side, px, sz FROM leader_ladder_live ORDER BY px DESC")
+        ours = db.rows("SELECT side, px, sz FROM orders WHERE status='open' ORDER BY px DESC")
+        return leader, ours
+
+    # History is written only when his ladder changes, so take the newest
+    # snapshot at or before `at_ts`. px=0 is the empty-ladder marker.
+    leader = db.rows(
+        "SELECT side, px, sz FROM leader_open_orders WHERE snapshot_ts="
+        "(SELECT MAX(snapshot_ts) FROM leader_open_orders WHERE snapshot_ts<=?) "
+        "AND px > 0 ORDER BY px DESC",
+        (at_ts,),
     )
+    # `orders.status` only records the CURRENT state, so our historical book comes
+    # from the mirror_map lifecycle (created_ts .. closed_ts) instead.
+    ours = db.rows(
+        "SELECT o.side, m.px, m.our_sz FROM mirror_map m JOIN orders o ON o.oid=m.our_oid "
+        "WHERE m.created_ts<=? AND (m.closed_ts IS NULL OR m.closed_ts>?) "
+        "ORDER BY m.px DESC",
+        (at_ts, at_ts),
+    )
+    return leader, ours
+
+
+def state_at(db: ReadOnlyDB, at_ts: int | None = None) -> str:
+    sql = "SELECT kind, message FROM events WHERE kind IN ('state_change','manual_reset')"
+    args: tuple = ()
+    if at_ts is not None:
+        sql += " AND ts<=?"
+        args = (at_ts,)
+    return resolve_state(db.q(sql + " ORDER BY id DESC LIMIT 1", args))
+
+
+def replay_range(db: ReadOnlyDB) -> tuple[int, int]:
+    """(first, last) recorded timestamps; (0, 0) when there is no history yet."""
+    rows = db.rows("SELECT MIN(ts), MAX(ts) FROM snapshots")
+    if not rows or rows[0][0] is None:
+        return 0, 0
+    return int(rows[0][0]), int(rows[0][1])
+
+
+def slider_to_ts(pct: float, lo: int, hi: int) -> int | None:
+    """Slider position -> timestamp. 100 (or no history) means LIVE."""
+    if pct >= 100 or not hi or hi <= lo:
+        return None
+    return int(lo + (hi - lo) * pct / 100)
+
+
+def build_view(db: ReadOnlyDB, cfg: Config, at_ts: int | None = None):
+    """All panels for one refresh. Pure-ish: DB in, Dash children out.
+
+    `at_ts=None` renders live; a timestamp renders the whole dashboard as it
+    stood at that moment (replay).
+    """
+    leader = snapshot_at(db, "leader", at_ts)
+    ours = snapshot_at(db, "copy", at_ts)
+    state = state_at(db, at_ts)
 
     last_ts = db.rows("SELECT MAX(ts) FROM snapshots")
     age_s = (time.time() * 1000 - (last_ts[0][0] or 0)) / 1000 if last_ts and last_ts[0][0] else 0
 
-    # Pending orders of BOTH accounts — the overlay source. leader_ladder_live is
-    # rewritten every cycle, so an emptied ladder actually disappears here.
-    leader_orders = db.rows("SELECT side, px, sz FROM leader_ladder_live ORDER BY px DESC")
-    our_orders = db.rows("SELECT side, px, sz FROM orders WHERE status='open' ORDER BY px DESC")
+    # Pending orders of BOTH accounts — the overlay source.
+    leader_orders, our_orders = ladder_at(db, at_ts)
     overlay = [("leader", s, p, z) for s, p, z in leader_orders]
     overlay += [("ours", s, p, z) for s, p, z in our_orders]
 
@@ -192,7 +250,13 @@ def build_view(db: ReadOnlyDB, cfg: Config):
             html.Span("● ", style={"color": STATE_COLORS.get(state, MUTED), "fontSize": 20}),
             html.Span(state, style={"color": STATE_COLORS.get(state, MUTED), "fontWeight": 700}),
             html.Span(f"   mode: {cfg.mode.upper()}", style={"color": MUTED, "marginLeft": 24}),
-            html.Span(f"   leader data: {age_s:.0f}s ago", style={"color": MUTED, "marginLeft": 24}),
+            html.Span(
+                f"   REPLAY {time.strftime('%Y-%m-%d %H:%M', time.gmtime(at_ts / 1000))}Z"
+                if at_ts
+                else f"   leader data: {age_s:.0f}s ago",
+                style={"color": "#d4a72c" if at_ts else MUTED, "marginLeft": 24,
+                       "fontWeight": 700 if at_ts else 400},
+            ),
             html.Button(
                 "HALT NOW", id="halt-btn", n_clicks=0,
                 style={"float": "right", "background": RED, "color": "white",
@@ -204,6 +268,8 @@ def build_view(db: ReadOnlyDB, cfg: Config):
     )
 
     candles = fetch_candles(api_url=cfg.api_url)
+    if at_ts:  # don't show the future during replay
+        candles = [c for c in candles if c["t"] <= at_ts]
     fig = go.Figure()
     if candles:
         fig.add_trace(
@@ -218,7 +284,10 @@ def build_view(db: ReadOnlyDB, cfg: Config):
         )
     shapes, annotations = order_overlay_shapes(overlay)
     for f_who, marker in (("leader_fills", "triangle-up"), ("fills", "triangle-up-open")):
-        fills = db.rows(f"SELECT ts, px, side FROM {f_who} ORDER BY ts DESC LIMIT 200")
+        fills = db.rows(
+            f"SELECT ts, px, side FROM {f_who} WHERE ts<=? ORDER BY ts DESC LIMIT 200",
+            (at_ts if at_ts else 1 << 62,),
+        )
         if fills:
             fig.add_trace(
                 go.Scatter(
@@ -236,10 +305,14 @@ def build_view(db: ReadOnlyDB, cfg: Config):
         shapes=shapes, annotations=annotations, template="plotly_dark",
         paper_bgcolor=PANEL, plot_bgcolor=PANEL, height=460,
         margin=dict(l=40, r=140, t=30, b=20), xaxis_rangeslider_visible=False,
-        title="BTC price - candles (Hyperliquid) with pending-order overlay",
+        title="BTC price - candles (Hyperliquid) with pending-order overlay"
+        + (" [REPLAY]" if at_ts else ""),
     )
 
-    curve = db.rows("SELECT ts, equity, drawdown_pct FROM equity_curve ORDER BY ts")
+    curve = db.rows(
+        "SELECT ts, equity, drawdown_pct FROM equity_curve WHERE ts<=? ORDER BY ts",
+        (at_ts if at_ts else 1 << 62,),
+    )
     eq_fig = go.Figure()
     if curve:
         eq_fig.add_trace(
@@ -279,7 +352,8 @@ def build_view(db: ReadOnlyDB, cfg: Config):
 
     decisions = db.rows(
         "SELECT ts, trigger, action, veto_reason, risk_state FROM decisions "
-        "ORDER BY id DESC LIMIT 15"
+        "WHERE ts<=? ORDER BY id DESC LIMIT 15",
+        (at_ts if at_ts else 1 << 62,),
     )
     active = html.Div(
         [
@@ -308,12 +382,49 @@ def build_view(db: ReadOnlyDB, cfg: Config):
     return [banner, dcc.Graph(figure=fig), dcc.Graph(figure=eq_fig), cards, active, recent]
 
 
+def _replay_bar(cfg: Config):
+    """Scrub back through recorded history. 100 = live.
+
+    ponytail: the slider is a PERCENTAGE of the recorded range, not a timestamp,
+    so its bounds never change as new data arrives and nothing fights the user
+    mid-drag.
+    """
+    btn = {"background": PANEL, "color": TEXT, "border": f"1px solid {MUTED}",
+           "padding": "4px 12px", "borderRadius": 6, "cursor": "pointer",
+           "marginRight": 6}
+    return html.Div(
+        [
+            html.Div(
+                [
+                    html.Span("REPLAY", style={"color": MUTED, "fontSize": 12,
+                                               "letterSpacing": 1, "marginRight": 16}),
+                    html.Button("< step", id="step-back", n_clicks=0, style=btn),
+                    html.Button("play", id="play-btn", n_clicks=0, style=btn),
+                    html.Button("step >", id="step-fwd", n_clicks=0, style=btn),
+                    html.Button("latest", id="live-btn", n_clicks=0, style=btn),
+                    html.Span(id="replay-label",
+                              style={"color": MUTED, "marginLeft": 16, "fontSize": 13}),
+                ],
+                style={"marginBottom": 8},
+            ),
+            dcc.Slider(id="replay-slider", min=0, max=100, step=0.5, value=100,
+                       marks=None, tooltip={"placement": "bottom"},
+                       updatemode="mouseup"),
+            dcc.Interval(id="play-tick", interval=1000, disabled=True),
+            dcc.Store(id="playing", data=False),
+        ],
+        style={"background": PANEL, "padding": "14px 20px", "borderRadius": 8,
+               "marginBottom": 12},
+    )
+
+
 def make_app(cfg: Config) -> dash.Dash:
     db = ReadOnlyDB(cfg.storage.db_path)
     app = dash.Dash(__name__, title="KK Copybot")
     app.layout = html.Div(
         [
             html.H2("Hyperliquid Copybot", style={"color": TEXT, "marginBottom": 4}),
+            _replay_bar(cfg),
             html.Div(id="content"),
             dcc.Interval(id="tick", interval=cfg.dashboard.refresh_s * 1000),
             html.Div(id="halt-ack", style={"color": RED, "marginTop": 8}),
@@ -322,9 +433,56 @@ def make_app(cfg: Config) -> dash.Dash:
                "fontFamily": "system-ui, sans-serif"},
     )
 
-    @app.callback(Output("content", "children"), Input("tick", "n_intervals"))
-    def refresh(_):
-        return build_view(db, cfg)
+    @app.callback(
+        Output("content", "children"),
+        Output("replay-label", "children"),
+        Input("tick", "n_intervals"),
+        Input("replay-slider", "value"),
+    )
+    def refresh(_n, pct):
+        lo, hi = replay_range(db)
+        at_ts = slider_to_ts(pct if pct is not None else 100, lo, hi)
+        label = (
+            "live"
+            if at_ts is None
+            else time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(at_ts / 1000))
+        )
+        return build_view(db, cfg, at_ts), label
+
+    @app.callback(
+        Output("playing", "data"),
+        Output("play-btn", "children"),
+        Output("play-tick", "disabled"),
+        Input("play-btn", "n_clicks"),
+        Input("live-btn", "n_clicks"),
+        State("playing", "data"),
+        prevent_initial_call=True,
+    )
+    def toggle_play(_p, _l, playing):
+        if dash.ctx.triggered_id == "live-btn":
+            return False, "play", True
+        playing = not playing
+        return playing, ("pause" if playing else "play"), not playing
+
+    @app.callback(
+        Output("replay-slider", "value"),
+        Input("play-tick", "n_intervals"),
+        Input("step-back", "n_clicks"),
+        Input("step-fwd", "n_clicks"),
+        Input("live-btn", "n_clicks"),
+        State("replay-slider", "value"),
+        prevent_initial_call=True,
+    )
+    def move(_tick, _b, _f, _l, pct):
+        pct = 100 if pct is None else pct
+        who = dash.ctx.triggered_id
+        if who == "live-btn":
+            return 100
+        if who == "step-back":
+            return max(0, pct - 0.5)
+        if who == "step-fwd":
+            return min(100, pct + 0.5)
+        return min(100, pct + 0.5)  # play tick
 
     @app.callback(
         Output("halt-ack", "children"),
